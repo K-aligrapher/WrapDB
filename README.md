@@ -3,7 +3,13 @@
 A from-scratch GPU SQL engine (C++/CUDA, no libcudf) with JIT-fused pipelines and a
 residency-aware CPU/GPU placement optimizer. See [docs/PRD.md](docs/PRD.md).
 
-**Status:** Phase 1 — CPU engine complete: columnar storage, CSV ingest, SQL parser, vectorized multithreaded
+**Status:** Phase 2 — hand-written GPU primitives done and benchmarked against CUB
+([docs/BENCHMARKS_GPU_PRIMS.md](docs/BENCHMARKS_GPU_PRIMS.md)): single-pass decoupled look-back scan (parity with CUB),
+fused warp-ballot compaction (parity or better, 3-5x faster than flags+scan+scatter), stable onesweep-style radix sort
+(0.65-0.86x of CUB), lock-free open-addressing hash table (7-10x faster than sort-based distinct counting).
+Run `.\build\release\warpdb_bench.exe`. Kernels live in `src/gpu/prims/`.
+
+**Phase 1** — CPU engine complete: columnar storage, CSV ingest, SQL parser, vectorized multithreaded
 executor (filter / hash join / hash aggregate / sort / top-k), verified against DuckDB on TPC-H.
 
 ```powershell
