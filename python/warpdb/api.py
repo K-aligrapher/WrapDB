@@ -193,6 +193,10 @@ class Database:
     def jit_stats(self) -> Dict[str, float]:
         return self._db.jit_stats()
 
+    def jit_preload(self, max_kernels: int = 64) -> int:
+        """Load recently used fused kernels from the on-disk cache now, instead of during the first query."""
+        return self._db.jit_preload(max_kernels)
+
 
 def connect(use_gpu: bool = True) -> Database:
     """Create an in-process database. With use_gpu=False the CUDA backend is not initialized at all."""

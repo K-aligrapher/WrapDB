@@ -60,6 +60,9 @@ class JitRuntime {
                                  const char** origin = nullptr);
   // Where the time of the most recent get() went, e.g. "disk read 0.1 ms, module load 2.9 ms" (for diagnostics).
   std::string last_timing() const;
+  // Loads the most recently used CUBINs from the on-disk cache into memory, so the queries that use them later
+  // never pay a module load (which can stall on some drivers / power states). Returns how many were loaded.
+  size_t preload(size_t max_kernels = 64);
   // True if get() would be cheap: the kernel is in the in-process cache or on disk (no NVRTC run needed).
   bool peek(const std::string& source, const std::string& entry);
   void launch(JitKernel& k, unsigned grid, unsigned block, ArgPack& args);

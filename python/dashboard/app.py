@@ -35,6 +35,7 @@ def get_db(sf: float):
         db.set_jit(True, min_rows=200000)
         db.ensure_calibrated()  # loads the stored cost model and warms the GPU (context, kernel modules) up front,
         #                         so the first query a user runs doesn't pay one-off start-up costs
+        db.jit_preload(64)      # same for the fused kernels cached on disk (module loads can stall for ~1-2 s)
     return db
 
 

@@ -204,3 +204,20 @@ def test_jit_works_when_queries_run_on_other_threads(db):
     for i, r in out.items():
         assert any("jit-fused" in t for t in r.trace), (i, r.trace)
         assert not any("fell back" in t for t in r.trace), (i, r.trace)
+
+
+def test_jit_preload_moves_module_loads_out_of_queries(db, df):
+    """Kernels cached on disk are loaded up front, so a later query needs no module load at all."""
+    q = "select tag, max(x * 7.125), count(*) from t where x > 3.5 group by tag"
+    db.set_jit(True, min_rows=0)
+    db.sql(q, device="gpu")  # compiles (or loads) the kernel and writes it to the disk cache
+    fresh = warpdb.connect()  # a new session: empty in-memory kernel cache in a real new process
+    fresh.load_dataframe("t", df)
+    fresh.set_jit(True, min_rows=0)
+    assert fresh.jit_preload(512) >= 0
+    before = fresh.jit_stats()
+    res = fresh.sql(q, device="gpu")
+    after = fresh.jit_stats()
+    assert any("jit-fused" in t for t in res.trace)
+    assert after["compiles"] == before["compiles"], "preloaded: no NVRTC"
+    assert after["load_ms"] == pytest.approx(before["load_ms"]), "preloaded: no module load during the query"

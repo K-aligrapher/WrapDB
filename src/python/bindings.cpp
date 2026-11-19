@@ -330,6 +330,11 @@ class PyDatabase {
   void set_jit(bool on) { if (gpu_) gpu_->set_jit(on); }
   bool jit_enabled() const { return gpu_ && gpu_->jit_enabled(); }
   void set_jit_min_rows(size_t n) { if (gpu_) gpu_->set_jit_min_rows(n); }
+  size_t jit_preload(size_t max_kernels) {
+    if (!gpu_) return 0;
+    py::gil_scoped_release release;
+    return gpu_->jit_preload(max_kernels);
+  }
   py::dict jit_stats() const {
     py::dict d;
     if (!gpu_) return d;
@@ -389,5 +394,6 @@ PYBIND11_MODULE(_warpdb, m) {
       .def("set_jit", &PyDatabase::set_jit)
       .def_property_readonly("jit_enabled", &PyDatabase::jit_enabled)
       .def("set_jit_min_rows", &PyDatabase::set_jit_min_rows)
-      .def("jit_stats", &PyDatabase::jit_stats);
+      .def("jit_stats", &PyDatabase::jit_stats)
+      .def("jit_preload", &PyDatabase::jit_preload, py::arg("max_kernels") = 64);
 }

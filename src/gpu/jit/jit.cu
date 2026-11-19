@@ -135,6 +135,37 @@ void JitRuntime::clear_memory_cache() {
 
 std::string JitRuntime::last_timing() const { return impl_->last_timing; }
 
+size_t JitRuntime::preload(size_t max_kernels) {
+  std::lock_guard<std::mutex> g(impl_->mu);
+  impl_->probe();
+  if (!impl_->ok || impl_->disk_dir.empty() || !std::filesystem::is_directory(impl_->disk_dir)) return 0;
+  cudaFree(nullptr);
+  std::vector<std::filesystem::directory_entry> files;
+  for (auto& e : std::filesystem::directory_iterator(impl_->disk_dir))
+    if (e.is_regular_file() && e.path().extension() == ".cubin") files.push_back(e);
+  std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.last_write_time() > b.last_write_time(); });
+  size_t loaded = 0;
+  for (auto& f : files) {
+    if (loaded >= max_kernels) break;
+    std::string key = f.path().stem().string();  // the file name is the cache key
+    if (impl_->cache.count(key)) continue;
+    std::ifstream in(f.path(), std::ios::binary | std::ios::ate);
+    if (!in) continue;
+    std::vector<char> cubin(static_cast<size_t>(in.tellg()));
+    in.seekg(0);
+    in.read(cubin.data(), static_cast<std::streamsize>(cubin.size()));
+    try {
+      Timer tl;
+      impl_->cache[key] = impl_->load(cubin, "k_main");  // every generated kernel's entry point is k_main
+      impl_->stats.load_ms += tl.ms();
+      ++loaded;
+    } catch (const JitError&) {
+      std::filesystem::remove(f.path());  // unloadable (e.g. other GPU / driver): drop it
+    }
+  }
+  return loaded;
+}
+
 bool JitRuntime::peek(const std::string& source, const std::string& entry) {
   std::lock_guard<std::mutex> g(impl_->mu);
   impl_->probe();

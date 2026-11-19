@@ -37,6 +37,7 @@ class GpuBackend : public Backend {
   void set_jit_min_rows(size_t n);      // compile unseen kernels only for inputs at least this large
   size_t jit_min_rows() const;
   JitStats jit_stats() const;
+  size_t jit_preload(size_t max_kernels = 64);  // warm the JIT from its on-disk cache
   void set_jit_force_capacity_for_test(size_t cap);  // 0 = size group tables from estimates (default)
 
  private:

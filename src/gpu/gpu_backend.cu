@@ -1250,6 +1250,7 @@ void GpuBackend::set_jit_min_rows(size_t n) { impl_->jit_min_rows = n; }
 size_t GpuBackend::jit_min_rows() const { return impl_->jit_min_rows; }
 void GpuBackend::set_jit_force_capacity_for_test(size_t cap) { impl_->jit_force_cap = cap; }
 JitStats GpuBackend::jit_stats() const { return JitRuntime::instance().stats(); }
+size_t GpuBackend::jit_preload(size_t max_kernels) { return JitRuntime::instance().preload(max_kernels); }
 bool GpuBackend::column_resident(const Column& c) const { return impl_->cache.resident(c); }
 size_t GpuBackend::cache_budget_bytes() const { return impl_->cache.budget(); }
 void GpuBackend::forget_columns(const std::vector<uint64_t>& uids) {
