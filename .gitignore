@@ -18,3 +18,4 @@ st_*.txt
 gtest_*.txt
 .streamlit/
 *.pyd.old
+*.pyd.*

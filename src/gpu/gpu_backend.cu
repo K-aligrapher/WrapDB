@@ -991,6 +991,8 @@ std::string jit_origin_note(const char* origin, double compile_ms, double kernel
   std::string s = "kernel ";
   s += fmt_ms(kernel_ms);
   s += o == "compiled" ? ", NVRTC compile " + fmt_ms(compile_ms) : ", " + o;
+  // when getting the kernel was unexpectedly slow, say where the time went (helps diagnose driver / disk stalls)
+  if (compile_ms > 250 && o != "compiled") s += " [" + JitRuntime::instance().last_timing() + "]";
   return s;
 }
 

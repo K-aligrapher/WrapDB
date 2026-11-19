@@ -50,6 +50,7 @@ struct JitRuntime::Impl {
   std::unordered_map<std::string, std::shared_ptr<JitKernel>> cache;
   std::unordered_map<std::string, std::string> failed;  // source key -> NVRTC error (never recompile a bad kernel)
   JitStats stats;
+  std::string last_timing;  // diagnostics for the most recent get()
 
   void probe() {
     if (probed) return;
@@ -132,6 +133,8 @@ void JitRuntime::clear_memory_cache() {
   impl_->cache.clear();
 }
 
+std::string JitRuntime::last_timing() const { return impl_->last_timing; }
+
 bool JitRuntime::peek(const std::string& source, const std::string& entry) {
   std::lock_guard<std::mutex> g(impl_->mu);
   impl_->probe();
@@ -145,11 +148,16 @@ bool JitRuntime::peek(const std::string& source, const std::string& entry) {
 
 std::shared_ptr<JitKernel> JitRuntime::get(const std::string& source, const std::string& entry, double* ms,
                                            const char** origin) {
+  Timer t_all;  // includes waiting for the lock and first-use initialization, unlike `t` below
   std::lock_guard<std::mutex> g(impl_->mu);
+  const double lock_ms = t_all.ms();
   impl_->probe();
+  const double probe_ms = t_all.ms() - lock_ms;
   // The driver API works on the CALLING THREAD's current context. Hosts such as Streamlit run every request on a
   // different thread, so the context created while probing is not necessarily current here: bind it (cheap).
+  Timer t_bind;
   cudaFree(nullptr);
+  const double bind_ms = t_bind.ms();
   if (!impl_->ok) throw JitError("NVRTC / CUDA driver API not available");
   Timer t;
   uint64_t h = fnv1a(source, fnv1a(impl_->arch + "|" + impl_->nvrtc_version + "|" + entry));
@@ -169,6 +177,7 @@ std::shared_ptr<JitKernel> JitRuntime::get(const std::string& source, const std:
   try {
     std::vector<char> cubin;
     bool from_disk = false;
+    Timer t_read;
     if (!path.empty()) {
       std::ifstream f(path, std::ios::binary | std::ios::ate);
       if (f) {
@@ -178,6 +187,7 @@ std::shared_ptr<JitKernel> JitRuntime::get(const std::string& source, const std:
         from_disk = !cubin.empty();
       }
     }
+    const double read_ms = t_read.ms();
     double compile_ms = 0;
     if (!from_disk) {
       Timer tc;
@@ -203,7 +213,12 @@ std::shared_ptr<JitKernel> JitRuntime::get(const std::string& source, const std:
       if (from_disk && !path.empty()) std::filesystem::remove(path);  // corrupt / stale CUBIN: rebuild next time
       throw;
     }
-    impl_->stats.load_ms += tl.ms();
+    const double load_ms = tl.ms();
+    impl_->stats.load_ms += load_ms;
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "lock wait %.1f ms, first-use init %.1f ms, context bind %.1f ms, %s %.1f ms, module load %.1f ms",
+                  lock_ms, probe_ms, bind_ms, from_disk ? "disk read" : "NVRTC compile", from_disk ? read_ms : compile_ms, load_ms);
+    impl_->last_timing = buf;
     impl_->cache[key] = k;
     if (ms) *ms = t.ms();
     if (origin) *origin = from_disk ? "disk cache" : "compiled";

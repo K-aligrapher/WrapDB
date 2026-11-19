@@ -33,6 +33,8 @@ def get_db(sf: float):
     warpdb.tpch.load(db, sf, generate=True)
     if db.has_gpu:
         db.set_jit(True, min_rows=200000)
+        db.ensure_calibrated()  # loads the stored cost model and warms the GPU (context, kernel modules) up front,
+        #                         so the first query a user runs doesn't pay one-off start-up costs
     return db
 
 

@@ -58,6 +58,8 @@ class JitRuntime {
   // *compile_ms is the time this call spent compiling/loading (0 on an in-memory hit).
   std::shared_ptr<JitKernel> get(const std::string& source, const std::string& entry, double* ms = nullptr,
                                  const char** origin = nullptr);
+  // Where the time of the most recent get() went, e.g. "disk read 0.1 ms, module load 2.9 ms" (for diagnostics).
+  std::string last_timing() const;
   // True if get() would be cheap: the kernel is in the in-process cache or on disk (no NVRTC run needed).
   bool peek(const std::string& source, const std::string& entry);
   void launch(JitKernel& k, unsigned grid, unsigned block, ArgPack& args);
