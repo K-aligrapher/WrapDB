@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <thread>
 
 #include "exec/engine.h"
 #include "gpu/gpu_backend.h"
@@ -185,6 +186,35 @@ TEST_F(Jit, FusedKernelsAreActuallyUsedAndFallBackCleanly) {
   EXPECT_FALSE(trace_has(off, "jit-fused"));
   backend().set_jit(true);
   e.device = "cpu";
+}
+
+// Regression: the CUDA driver API uses the calling thread's context. Hosts like Streamlit run every request on a
+// different thread, and the JIT used to fail there with "invalid device context" (after wasting a full NVRTC compile).
+TEST_F(Jit, WorksFromAnyThread) {
+  Engine& e = eng();
+  e.device = "gpu";
+  backend().set_jit(true);
+  const char* q = "select flag, note, count(*), sum(price * 3.25) from fact where qty > 7 group by flag, note";
+  e.execute(q);  // main thread
+  QueryResult from_thread;
+  std::thread t([&] {  // a fresh thread that has never touched CUDA; new constant => a kernel that must be built here
+    from_thread = e.execute("select flag, note, count(*), sum(price * 4.75) from fact where qty > 9 group by flag, note");
+  });
+  t.join();
+  e.device = "cpu";
+  EXPECT_TRUE(trace_has(from_thread, "jit-fused")) << "JIT must work on any thread";
+  EXPECT_FALSE(trace_has(from_thread, "fell back")) << "no fallback expected";
+}
+
+TEST_F(Jit, FailedCompilesDoNotPolluteStageTimes) {
+  // An unsupported shape is rejected by the code generator before any compile; the stage time must stay small and the
+  // query must still be correct.
+  Engine& e = eng();
+  e.device = "gpu";
+  QueryResult r = e.execute("select count(*) from cust c1, cust c2 where c1.seg = c2.seg and c1.region <> c2.region");
+  e.device = "cpu";
+  EXPECT_EQ(r.nrows, 1u);
+  for (auto& st : r.stages) EXPECT_LT(st.ms, 2000.0);
 }
 
 TEST_F(Jit, GroupTableOverflowIsDetectedAndRetried) {

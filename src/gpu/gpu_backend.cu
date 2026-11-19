@@ -975,9 +975,15 @@ std::shared_ptr<JitKernel> jit_kernel(const JitPlan& plan, size_t rows, JitCtx& 
   auto& rt = JitRuntime::instance();
   if (rows < jc.min_rows && !rt.peek(plan.source, plan.entry))
     throw JitUnsupported("input is small and the kernel is not cached: compiling would cost more than it saves");
-  auto k = rt.get(plan.source, plan.entry, ms, origin);
-  jc.compile_ms += *ms;  // one-off cost: excluded from the stage times the cost model learns from
-  return k;
+  Timer t;
+  try {
+    auto k = rt.get(plan.source, plan.entry, ms, origin);
+    jc.compile_ms += *ms;  // one-off cost: excluded from the stage times the cost model learns from
+    return k;
+  } catch (...) {
+    jc.compile_ms += t.ms();  // a failed compile is just as one-off: keep it out of the learned stage times
+    throw;
+  }
 }
 
 std::string jit_origin_note(const char* origin, double compile_ms, double kernel_ms) {

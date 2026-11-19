@@ -48,6 +48,7 @@ struct JitRuntime::Impl {
   bool probed = false, ok = false;
   std::string arch, nvrtc_version, disk_dir;
   std::unordered_map<std::string, std::shared_ptr<JitKernel>> cache;
+  std::unordered_map<std::string, std::string> failed;  // source key -> NVRTC error (never recompile a bad kernel)
   JitStats stats;
 
   void probe() {
@@ -146,6 +147,9 @@ std::shared_ptr<JitKernel> JitRuntime::get(const std::string& source, const std:
                                            const char** origin) {
   std::lock_guard<std::mutex> g(impl_->mu);
   impl_->probe();
+  // The driver API works on the CALLING THREAD's current context. Hosts such as Streamlit run every request on a
+  // different thread, so the context created while probing is not necessarily current here: bind it (cheap).
+  cudaFree(nullptr);
   if (!impl_->ok) throw JitError("NVRTC / CUDA driver API not available");
   Timer t;
   uint64_t h = fnv1a(source, fnv1a(impl_->arch + "|" + impl_->nvrtc_version + "|" + entry));
@@ -159,6 +163,7 @@ std::shared_ptr<JitKernel> JitRuntime::get(const std::string& source, const std:
     if (origin) *origin = "memory cache";
     return it->second;
   }
+  if (auto f = impl_->failed.find(key); f != impl_->failed.end()) throw JitError(f->second);
   std::string path;
   if (!impl_->disk_dir.empty()) path = impl_->disk_dir + "\\" + key + ".cubin";
   try {
@@ -191,20 +196,28 @@ std::shared_ptr<JitKernel> JitRuntime::get(const std::string& source, const std:
       impl_->stats.disk_hits++;
     }
     Timer tl;
-    auto k = impl_->load(cubin, entry);
+    std::shared_ptr<JitKernel> k;
+    try {
+      k = impl_->load(cubin, entry);
+    } catch (const JitError&) {
+      if (from_disk && !path.empty()) std::filesystem::remove(path);  // corrupt / stale CUBIN: rebuild next time
+      throw;
+    }
     impl_->stats.load_ms += tl.ms();
     impl_->cache[key] = k;
     if (ms) *ms = t.ms();
     if (origin) *origin = from_disk ? "disk cache" : "compiled";
     return k;
-  } catch (const JitError&) {
+  } catch (const JitError& e) {
     impl_->stats.failures++;
+    if (std::string(e.what()).rfind("NVRTC compilation failed", 0) == 0) impl_->failed[key] = e.what();
     throw;
   }
 }
 
 void JitRuntime::launch(JitKernel& k, unsigned grid, unsigned block, ArgPack& args) {
   if (grid == 0) return;
+  cudaFree(nullptr);  // see get(): make the primary context current on this thread
   CUresult r = cuLaunchKernel(k.fn, grid, 1, 1, block, 1, 1, 0, nullptr, args.data(), nullptr);
   if (r != CUDA_SUCCESS) throw JitError("cuLaunchKernel failed: " + cu_error(r));
 }

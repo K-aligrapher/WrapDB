@@ -185,3 +185,22 @@ def test_tpch_matches_duckdb():
                     np.testing.assert_allclose(a.astype(float), b.astype(float), rtol=1e-6, err_msg=f"{name} {dev} {col}")
                 else:
                     assert [str(x) for x in a] == [str(x) for x in b], (name, dev, col)
+
+
+def test_jit_works_when_queries_run_on_other_threads(db):
+    """Streamlit runs every rerun on a different thread; the CUDA driver API needs a context per thread."""
+    import threading
+
+    db.set_jit(True, min_rows=0)
+    out = {}
+
+    def run(i):
+        out[i] = db.sql(f"select tag, sum(x * {2 + i}.5) from t where x > {i} group by tag", device="gpu")
+
+    for i in range(3):  # three different threads, three never-seen kernels
+        th = threading.Thread(target=run, args=(i,))
+        th.start()
+        th.join()
+    for i, r in out.items():
+        assert any("jit-fused" in t for t in r.trace), (i, r.trace)
+        assert not any("fell back" in t for t in r.trace), (i, r.trace)
