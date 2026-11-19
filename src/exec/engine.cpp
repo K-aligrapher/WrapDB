@@ -491,6 +491,15 @@ void split_and(const ExprP& e, std::vector<ExprP>& out) {
   }
 }
 
+StageStat make_stat(StageOp op, bool gpu, const std::string& label, double rin, double raux, double rout, int k1,
+                    int k2, double ms, int k3 = 0) {
+  StageStat s;
+  s.op = op; s.gpu = gpu; s.label = label;
+  s.rows_in = rin; s.rows_aux = raux; s.rows_out = rout;
+  s.k1 = k1; s.k2 = k2; s.k3 = k3; s.ms = ms;
+  return s;
+}
+
 std::string fmt_ms(double ms) {
   char b[32];
   std::snprintf(b, sizeof b, "%.2f ms", ms);
@@ -533,8 +542,51 @@ double Engine::column_ndv(const std::shared_ptr<Table>& t, int col) {
 
 double Engine::key_ndv(const PlannedQuery& pq, const ExprP& e, size_t n) {
   double nn = std::max<double>(1.0, static_cast<double>(n));
-  if (e->kind != Expr::Col) return nn;
-  return std::min(column_ndv(pq.tabs[e->tbl], e->col), nn);
+  if (e->kind == Expr::Col) return std::min(column_ndv(pq.tabs[e->tbl], e->col), nn);
+  if (e->kind == Expr::Int || e->kind == Expr::Float || e->kind == Expr::Date || e->kind == Expr::Str) return 1.0;
+
+  // General expression over one table (year(d), a + b, CASE ...): evaluate it on a strided sample and count
+  // distinct values. Few distinct values in the sample => the domain is small (saturated); a nearly-unique
+  // sample => scale up to the table size.
+  std::set<int> ts;
+  tables_of(*e, ts);
+  if (ts.size() != 1) return nn;
+  const int k = *ts.begin();
+  const size_t rows = pq.tabs[k]->nrows;
+  if (rows == 0) return 1.0;
+  std::string key = std::to_string(pq.tabs[k]->cols[0]->uid) + "|ndv|" + e->str();
+  double d_est;
+  if (auto hit = sel_cache_.find(key); hit != sel_cache_.end()) {
+    d_est = hit->second;
+  } else {
+    d_est = static_cast<double>(rows);
+    try {
+      const size_t S = std::min<size_t>(rows, 4096);
+      Relation r;
+      r.tbls = {k};
+      r.n = S;
+      r.rid.resize(1);
+      r.rid[0].resize(S);
+      for (size_t i = 0; i < S; ++i) r.rid[0][i] = static_cast<uint32_t>(static_cast<uint64_t>(i) * rows / S);
+      RelScope sc(pq.tabs, std::move(r));
+      VP v = materialize(eval(*e, sc), S);
+      std::set<int64_t> seen;
+      for (size_t i = 0; i < S; ++i) {
+        int64_t bits = 0;
+        if (v->kind == Value::I || v->kind == Value::S) bits = v->i[i];
+        else if (v->kind == Value::F) std::memcpy(&bits, &v->f[i], 8);
+        else if (v->kind == Value::B) bits = v->b[i];
+        seen.insert(bits);
+      }
+      double d = static_cast<double>(seen.size());
+      d_est = d < 0.7 * static_cast<double>(S) ? d : std::min(static_cast<double>(rows), d * static_cast<double>(rows) / static_cast<double>(S));
+    } catch (const std::exception&) {
+      d_est = static_cast<double>(rows);  // cannot evaluate on a sample: assume the worst
+    }
+    if (sel_cache_.size() > 4096) sel_cache_.clear();
+    sel_cache_[key] = d_est;
+  }
+  return std::min(d_est, nn);
 }
 
 int Engine::pick_start(const PlannedQuery& pq, const std::vector<size_t>& rel_n) const {
@@ -551,6 +603,23 @@ int Engine::pick_start(const PlannedQuery& pq, const std::vector<size_t>& rel_n)
 
 // Pick the connected table whose join with the current result is estimated to be smallest:
 //   |cur| * |cand| / prod_over_edges(max(ndv(cur key), ndv(cand key)))
+double Engine::join_estimate(const PlannedQuery& pq, const std::vector<bool>& joined, size_t cur_n, int k,
+                             const std::vector<size_t>& rel_n, int* keys) {
+  double est = static_cast<double>(cur_n) * static_cast<double>(rel_n[k]);
+  int nk = 0;
+  for (auto& e : pq.edges) {
+    bool cur_is_a = joined[e.ta] && e.tb == k, cur_is_b = joined[e.tb] && e.ta == k;
+    if (!cur_is_a && !cur_is_b) continue;
+    ++nk;
+    double nc = key_ndv(pq, cur_is_a ? e.ea : e.eb, cur_n), nd = key_ndv(pq, cur_is_a ? e.eb : e.ea, rel_n[k]);
+    est /= std::max(1.0, std::max(nc, nd));
+  }
+  if (keys) *keys = nk;
+  return est;
+}
+
+// Pick the connected table whose join with the current result is estimated to be smallest:
+//   |cur| * |cand| / prod_over_edges(max(ndv(cur key), ndv(cand key)))
 int Engine::pick_next(const PlannedQuery& pq, const std::vector<bool>& joined, size_t cur_n,
                       const std::vector<size_t>& rel_n) {
   const int T = static_cast<int>(pq.tabs.size());
@@ -558,28 +627,104 @@ int Engine::pick_next(const PlannedQuery& pq, const std::vector<bool>& joined, s
   double best_est = 0;
   for (int k = 0; k < T; ++k) {
     if (joined[k]) continue;
-    bool conn = false;
-    double est = static_cast<double>(cur_n) * static_cast<double>(rel_n[k]);
-    for (auto& e : pq.edges) {
-      bool cur_is_a = joined[e.ta] && e.tb == k, cur_is_b = joined[e.tb] && e.ta == k;
-      if (!cur_is_a && !cur_is_b) continue;
-      conn = true;
-      double nc = key_ndv(pq, cur_is_a ? e.ea : e.eb, cur_n), nk = key_ndv(pq, cur_is_a ? e.eb : e.ea, rel_n[k]);
-      est /= std::max(1.0, std::max(nc, nk));
-    }
-    if (conn && (best < 0 || est < best_est)) { best = k; best_est = est; }
+    int nk = 0;
+    double est = join_estimate(pq, joined, cur_n, k, rel_n, &nk);
+    if (nk > 0 && (best < 0 || est < best_est)) { best = k; best_est = est; }
   }
   return best;
 }
 
+double Engine::sample_selectivity(const PlannedQuery& pq, int k) {
+  const size_t n = pq.tabs[k]->nrows;
+  if (n == 0) return 0.0;
+  if (pq.push[k].empty()) return 1.0;
+  std::string cache_key = std::to_string(pq.tabs[k]->cols[0]->uid) + "|" + std::to_string(n);
+  for (auto& c : pq.push[k]) cache_key += "|" + c->str();
+  if (auto hit = sel_cache_.find(cache_key); hit != sel_cache_.end()) return hit->second;
+  const size_t S = std::min<size_t>(n, 4096);
+  Relation r;
+  r.tbls = {k};
+  r.n = S;
+  r.rid.resize(1);
+  r.rid[0].resize(S);
+  for (size_t i = 0; i < S; ++i) r.rid[0][i] = static_cast<uint32_t>(static_cast<uint64_t>(i) * n / S);
+  RelScope sc(pq.tabs, std::move(r));
+  for (auto& c : pq.push[k]) {
+    VP b = eval(*c, sc);
+    sc.set_rows(select_true(*b));
+  }
+  double passed = static_cast<double>(sc.n);
+  if (passed == 0) passed = 0.5;  // nothing in the sample passed: assume a small but non-zero selectivity
+  double sel = passed / static_cast<double>(S);
+  if (sel_cache_.size() > 4096) sel_cache_.clear();
+  sel_cache_[cache_key] = sel;
+  return sel;
+}
+
+static void collect_cols(const Expr& e, std::set<std::pair<int, int>>& out) {
+  if (e.kind == Expr::Col) out.insert({e.tbl, e.col});
+  for (auto& a : e.args) collect_cols(*a, out);
+}
+
+static int count_nodes(const Expr& e) {
+  int n = 0;
+  switch (e.kind) {
+    case Expr::Bin: case Expr::Not: case Expr::Neg: case Expr::Between: case Expr::In: case Expr::Like:
+    case Expr::Case: case Expr::Func: n = 1; break;
+    default: break;
+  }
+  for (auto& a : e.args) n += count_nodes(*a);
+  return n;
+}
+
+int expr_nodes(const std::vector<ExprP>& exprs) {
+  int n = 0;
+  for (auto& e : exprs) n += count_nodes(*e);
+  return n;
+}
+
+int agg_expr_nodes(const PlannedQuery& pq) {
+  int n = expr_nodes(pq.sel.group_by);
+  for (auto& a : pq.aggs)
+    for (auto& arg : a->args)
+      if (arg->kind != Expr::Star) n += count_nodes(*arg);
+  return n;
+}
+
+int distinct_columns(const std::vector<ExprP>& exprs) {
+  std::set<std::pair<int, int>> cols;
+  for (auto& e : exprs) collect_cols(*e, cols);
+  return static_cast<int>(cols.size());
+}
+
 QueryResult Engine::execute(const std::string& sql) {
   PlannedQuery pq = plan(sql);
-  if (device == "gpu" && gpu_) {
-    QueryResult r = gpu_->execute(*this, pq);
-    r.explain = pq.sel.explain;
-    return r;
+  if (pq.sel.explain && !pq.sel.analyze) return explain_only(pq);  // estimates only, nothing is executed
+
+  std::string dev = device;
+  PlacementEstimate est;
+  double decide_ms = 0;
+  const bool automatic = dev == "auto";
+  if (automatic) {
+    Timer td;
+    ensure_calibrated();
+    td.reset();
+    est = estimate_placement(pq);
+    decide_ms = td.ms();
+    dev = est.choice;
   }
-  return execute_cpu(pq);
+  if (dev == "gpu" && !gpu_) throw Error("no GPU backend available");
+
+  QueryResult r = (dev == "gpu") ? gpu_->execute(*this, pq) : execute_cpu(pq);
+  r.explain = pq.sel.explain;
+  r.device_used = dev;
+  if (learn)
+    for (auto& st : r.stages) cost.observe(st);
+  if (automatic) {
+    r.plan_lines = est.lines;
+    decisions.push_back({sql, est.cpu_ms, est.gpu_ms, dev, r.ms, decide_ms});
+  }
+  return r;
 }
 
 PlannedQuery Engine::plan(const std::string& sql) {
@@ -766,6 +911,8 @@ QueryResult Engine::execute_cpu(PlannedQuery& pq) {
     rels[k] = std::move(sc.rel);
     trace("scan " + tabs[k]->name + ": " + std::to_string(tabs[k]->nrows) + " -> " + std::to_string(rels[k].n) +
           " rows (" + std::to_string(push[k].size()) + " filters, " + fmt_ms(t.ms()) + ")");
+    res.stages.push_back(make_stat(StageOp::Scan, false, tabs[k]->name, static_cast<double>(tabs[k]->nrows), 0,
+                                   static_cast<double>(rels[k].n), distinct_columns(push[k]), expr_nodes(push[k]), t.ms()));
   }
 
   // ---- joins (greedy: smallest first, always join the smallest connected table) ----
@@ -811,6 +958,9 @@ QueryResult Engine::execute_cpu(PlannedQuery& pq) {
       joined[best] = true;
       trace("hash join " + tabs[best]->name + " (" + std::to_string(kc.size()) + " keys): " + std::to_string(ln) +
             " x " + std::to_string(rn) + " -> " + std::to_string(cur.n) + " rows (" + fmt_ms(t.ms()) + ")");
+      res.stages.push_back(make_stat(StageOp::Join, false, tabs[best]->name, static_cast<double>(ln),
+                                     static_cast<double>(rn), static_cast<double>(cur.n), static_cast<int>(kc.size()),
+                                     static_cast<int>(cur.tbls.size()), t.ms()));
     }
   }
 
@@ -847,6 +997,9 @@ QueryResult Engine::execute_cpu(PlannedQuery& pq) {
       for (size_t a = 0; a < aggs.size(); ++a) as->m[aggs[a]->str()] = ao.aggs[a];
       trace("hash aggregate: " + std::to_string(nin) + " rows -> " + std::to_string(ao.n) + " groups (" +
             std::to_string(s.group_by.size()) + " keys, " + std::to_string(aggs.size()) + " aggs, " + fmt_ms(t.ms()) + ")");
+      res.stages.push_back(make_stat(StageOp::Aggregate, false, "", static_cast<double>(nin), 0,
+                                     static_cast<double>(ao.n), static_cast<int>(s.group_by.size()),
+                                     static_cast<int>(aggs.size()), t.ms(), agg_expr_nodes(pq)));
       scope = std::move(as);
       if (s.having) {
         VP b = eval(*s.having, *scope);
@@ -871,6 +1024,8 @@ QueryResult Engine::execute_cpu(PlannedQuery& pq) {
       idx = sort_perm(keys, desc, scope->n, s.limit);
       trace("sort " + std::to_string(scope->n) + " rows by " + std::to_string(keys.size()) + " keys" +
             (s.limit >= 0 ? " (top-" + std::to_string(s.limit) + ")" : "") + " (" + fmt_ms(t.ms()) + ")");
+      res.stages.push_back(make_stat(StageOp::Sort, false, "", static_cast<double>(scope->n), 0,
+                                     static_cast<double>(idx.size()), static_cast<int>(keys.size()), 0, t.ms()));
     } else {
       size_t k = std::min<size_t>(scope->n, static_cast<size_t>(s.limit));
       idx.resize(k);
@@ -881,12 +1036,15 @@ QueryResult Engine::execute_cpu(PlannedQuery& pq) {
 
   // ---- projection ----
   res.nrows = scope->n;
+  Timer tproj;
   for (auto& it : s.items) {
     VP v = eval(*it.e, *scope);
     res.cols.push_back(materialize(v, res.nrows));
     std::string name = !it.alias.empty() ? it.alias : (it.e->kind == Expr::Col ? it.e->name : it.text);
     res.names.push_back(name);
   }
+  res.stages.push_back(make_stat(StageOp::Project, false, "", static_cast<double>(res.nrows), 0,
+                                 static_cast<double>(res.nrows), static_cast<int>(s.items.size()), 0, tproj.ms()));
   res.ms = total.ms();
   trace("total: " + std::to_string(res.nrows) + " rows in " + fmt_ms(res.ms));
   return res;

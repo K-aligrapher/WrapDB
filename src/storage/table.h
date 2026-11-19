@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -26,7 +27,13 @@ inline const char* type_name(Type t) {
 // VARCHAR is dictionary-encoded and the dictionary is SORTED, so code order == string order
 // (range predicates, ORDER BY and GROUP BY can all work on the 4-byte codes).
 // NULLs are not supported in v1 (SSB / TPC-H contain none).
+inline uint64_t next_column_uid() {
+  static std::atomic<uint64_t> counter{1};
+  return counter.fetch_add(1);
+}
+
 struct Column {
+  uint64_t uid = next_column_uid();  // process-unique id; device caches key on this, never on the address
   Type type = Type::INT32;
   std::vector<int32_t> i32;
   std::vector<int64_t> i64;

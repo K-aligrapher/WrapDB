@@ -203,7 +203,8 @@ DVP mask_lookup(const DValue& s, const std::vector<uint8_t>& mask, size_t n) {
 
 DVP cmp_str_lit(CmpOp op, const DValue& s, const std::string& lit, size_t n) {
   const auto& d = s.dict->dict;
-  std::vector<uint8_t> mask(d.size());
+  auto mask_p = cached_dict_mask(s.dict->uid, "cmp" + std::to_string(static_cast<int>(op)) + "|" + lit, d.size(),
+                                 [&](std::vector<uint8_t>& mask) {
   for (size_t k = 0; k < d.size(); ++k) {
     int c = d[k].compare(lit);
     switch (op) {
@@ -215,7 +216,8 @@ DVP cmp_str_lit(CmpOp op, const DValue& s, const std::string& lit, size_t n) {
       case CmpOp::Ge: mask[k] = c >= 0; break;
     }
   }
-  return mask_lookup(s, mask, n);
+  });
+  return mask_lookup(s, *mask_p, n);
 }
 
 DVP d_compare(CmpOp op, const DValue& a, const DValue& b, size_t n) {
@@ -360,9 +362,12 @@ DVP d_eval(const Expr& e, DScope& sc) {
           set.insert(it->lit);
         }
         const auto& d = x->dict->dict;
-        std::vector<uint8_t> mask(d.size());
-        for (size_t k = 0; k < d.size(); ++k) mask[k] = set.count(d[k]) != 0;
-        r = mask_lookup(*x, mask, n);
+        std::string key = "in";
+        for (auto& v : set) key += "|" + v;
+        auto mask = cached_dict_mask(x->dict->uid, key, d.size(), [&](std::vector<uint8_t>& m) {
+          for (size_t k = 0; k < d.size(); ++k) m[k] = set.count(d[k]) != 0;
+        });
+        r = mask_lookup(*x, *mask, n);
       } else {
         for (size_t k = 1; k < e.args.size(); ++k) {
           DVP c = d_compare(CmpOp::Eq, *x, *d_eval(*e.args[k], sc), n);
@@ -376,9 +381,10 @@ DVP d_eval(const Expr& e, DScope& sc) {
       DVP x = d_eval(*e.args[0], sc), p = d_eval(*e.args[1], sc);
       if (x->kind != Value::S || p->kind != Value::L) throw Error("LIKE requires a VARCHAR column and a string pattern");
       const auto& d = x->dict->dict;
-      std::vector<uint8_t> mask(d.size());
-      for (size_t k = 0; k < d.size(); ++k) mask[k] = like_match(d[k], p->lit);
-      DVP r = mask_lookup(*x, mask, n);
+      auto mask = cached_dict_mask(x->dict->uid, "like|" + p->lit, d.size(), [&](std::vector<uint8_t>& m) {
+        for (size_t k = 0; k < d.size(); ++k) m[k] = like_match(d[k], p->lit);
+      });
+      DVP r = mask_lookup(*x, *mask, n);
       return e.negated ? d_not(*r, n) : r;
     }
     case Expr::Case: {
@@ -888,6 +894,14 @@ std::string fmt_ms(double ms) {
   std::snprintf(b, sizeof b, "%.2f ms", ms);
   return b;
 }
+StageStat make_stat(StageOp op, const std::string& label, double rin, double raux, double rout, int k1, int k2,
+                    double ms, int k3 = 0) {
+  StageStat s;
+  s.op = op; s.gpu = true; s.label = label;
+  s.rows_in = rin; s.rows_aux = raux; s.rows_out = rout;
+  s.k1 = k1; s.k2 = k2; s.k3 = k3; s.ms = ms;
+  return s;
+}
 double sync_ms(const Timer& t) {
   WDB_CUDA_CHECK(cudaDeviceSynchronize());
   return t.ms();
@@ -935,6 +949,58 @@ GpuMemStats GpuBackend::mem_stats() const {
   return s;
 }
 void GpuBackend::drop_cache() { impl_->cache.clear(); }
+bool GpuBackend::column_resident(const Column& c) const { return impl_->cache.resident(c); }
+size_t GpuBackend::cache_budget_bytes() const { return impl_->cache.budget(); }
+void GpuBackend::forget_columns(const std::vector<uint64_t>& uids) {
+  for (uint64_t u : uids) impl_->cache.erase(u);
+}
+std::string GpuBackend::fingerprint() const {
+  cudaDeviceProp p{};
+  cudaGetDeviceProperties(&p, 0);
+  return std::string(p.name) + "|sm" + std::to_string(p.major) + std::to_string(p.minor);
+}
+
+static __global__ void empty_kernel() {}
+
+// PCIe bandwidth (pageable host memory, as our columns live in std::vector), kernel-launch latency, VRAM bandwidth.
+bool GpuBackend::measure_hardware(HwProfile& hw) {
+  const size_t bytes = size_t(64) << 20;
+  std::vector<char> host(bytes, 1);
+  GpuVec<uint8_t> dev(bytes), dev2(bytes);
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+  std::vector<double> h2d, d2h, d2d;
+  for (int i = 0; i < 7; ++i) {
+    Timer t;
+    WDB_CUDA_CHECK(cudaMemcpy(dev.data(), host.data(), bytes, cudaMemcpyHostToDevice));
+    h2d.push_back(t.ms());
+    t.reset();
+    WDB_CUDA_CHECK(cudaMemcpy(host.data(), dev.data(), bytes, cudaMemcpyDeviceToHost));
+    d2h.push_back(t.ms());
+    t.reset();
+    WDB_CUDA_CHECK(cudaMemcpy(dev2.data(), dev.data(), bytes, cudaMemcpyDeviceToDevice));
+    WDB_CUDA_CHECK(cudaDeviceSynchronize());
+    d2d.push_back(t.ms());
+  }
+  hw.h2d_gbs = bytes / 1e6 / median(h2d);   // bytes / 1e6 = MB; MB per ms == GB/s
+  hw.d2h_gbs = bytes / 1e6 / median(d2h);
+  hw.gpu_membw_gbs = 2.0 * bytes / 1e6 / median(d2d);  // read + write
+  for (int i = 0; i < 20; ++i) {  // warm up context / driver
+    empty_kernel<<<1, 1>>>();
+    cudaDeviceSynchronize();
+  }
+  Timer t;
+  const int reps = 300;
+  for (int i = 0; i < reps; ++i) {
+    empty_kernel<<<1, 1>>>();
+    cudaDeviceSynchronize();
+  }
+  hw.launch_us = t.ms() * 1000.0 / reps;
+  hw.has_gpu = true;
+  return true;
+}
 
 QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
   Timer total;
@@ -952,6 +1018,7 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
   std::vector<DRel> rels(T);
   for (int k = 0; k < T; ++k) {
     Timer t;
+    const double up0 = ctx.upload_ms;  // column uploads triggered inside a stage are accounted separately
     DRel r;
     r.tbls = {k};
     r.n = tabs[k]->nrows;
@@ -964,8 +1031,11 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
       sc.set_rows(sel.idx, sel.k);
     }
     rels[k] = std::move(sc.rel);
+    const double ms = sync_ms(t) - (ctx.upload_ms - up0);
     trace("gpu scan " + tabs[k]->name + ": " + std::to_string(tabs[k]->nrows) + " -> " + std::to_string(rels[k].n) +
-          " rows (" + std::to_string(pq.push[k].size()) + " filters, " + fmt_ms(sync_ms(t)) + ")");
+          " rows (" + std::to_string(pq.push[k].size()) + " filters, " + fmt_ms(ms) + ")");
+    res.stages.push_back(make_stat(StageOp::Scan, tabs[k]->name, static_cast<double>(tabs[k]->nrows), 0,
+                                   static_cast<double>(rels[k].n), distinct_columns(pq.push[k]), expr_nodes(pq.push[k]), ms));
   }
 
   // ---- joins ----
@@ -981,6 +1051,7 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
       int best = eng.pick_next(pq, joined, cur.n, rel_n);
       if (best < 0) throw Error("cross joins are not supported: add an equality join condition between all tables");
       Timer t;
+      const double up0 = ctx.upload_ms;
       std::vector<ExprP> kc, kb;
       for (auto& e : pq.edges) {
         if (joined[e.ta] && e.tb == best) { kc.push_back(e.ea); kb.push_back(e.eb); }
@@ -1009,8 +1080,12 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
       }
       cur = std::move(o);
       joined[best] = true;
+      const double jms = sync_ms(t) - (ctx.upload_ms - up0);
       trace("gpu hash join " + tabs[best]->name + " (" + std::to_string(kc.size()) + " keys): " + std::to_string(ln) +
-            " x " + std::to_string(rn) + " -> " + std::to_string(cur.n) + " rows (" + fmt_ms(sync_ms(t)) + ")");
+            " x " + std::to_string(rn) + " -> " + std::to_string(cur.n) + " rows (" + fmt_ms(jms) + ")");
+      res.stages.push_back(make_stat(StageOp::Join, tabs[best]->name, static_cast<double>(ln), static_cast<double>(rn),
+                                     static_cast<double>(cur.n), static_cast<int>(kc.size()),
+                                     static_cast<int>(cur.tbls.size()), jms));
     }
   }
 
@@ -1026,6 +1101,7 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
 
     if (pq.agg_mode) {
       Timer t;
+      const double up0 = ctx.upload_ms;
       std::vector<DVP> keyv;
       for (auto& g : s.group_by) keyv.push_back(d_eval(*g, *rs));
       std::vector<AggInput> ins;
@@ -1046,9 +1122,13 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
       as->n = ao.n;
       for (size_t j = 0; j < s.group_by.size(); ++j) as->m[s.group_by[j]->str()] = ao.keys[j];
       for (size_t a = 0; a < pq.aggs.size(); ++a) as->m[pq.aggs[a]->str()] = ao.aggs[a];
+      const double ams = sync_ms(t) - (ctx.upload_ms - up0);
       trace("gpu hash aggregate: " + std::to_string(nin) + " rows -> " + std::to_string(ao.n) + " groups (" +
             std::to_string(s.group_by.size()) + " keys, " + std::to_string(pq.aggs.size()) + " aggs, " +
-            fmt_ms(sync_ms(t)) + ")");
+            fmt_ms(ams) + ")");
+      res.stages.push_back(make_stat(StageOp::Aggregate, "", static_cast<double>(nin), 0, static_cast<double>(ao.n),
+                                     static_cast<int>(s.group_by.size()), static_cast<int>(pq.aggs.size()), ams,
+                                     agg_expr_nodes(pq)));
       scope = std::move(as);
       if (s.having) {
         DVP b = d_eval(*s.having, *scope);
@@ -1063,6 +1143,7 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
   // ---- ORDER BY / LIMIT ----
   if (!s.order_by.empty() || s.limit >= 0) {
     Timer t;
+    const double up0 = ctx.upload_ms;
     GpuVec<uint32_t> perm;
     size_t k = scope->n;
     if (!s.order_by.empty()) {
@@ -1074,8 +1155,11 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
       }
       perm = d_sort_perm(keys, desc, scope->n);
       if (s.limit >= 0) k = std::min<size_t>(k, static_cast<size_t>(s.limit));
+      const double sms = sync_ms(t) - (ctx.upload_ms - up0);
       trace("gpu radix sort " + std::to_string(scope->n) + " rows by " + std::to_string(keys.size()) + " keys" +
-            (s.limit >= 0 ? " (limit " + std::to_string(s.limit) + ")" : "") + " (" + fmt_ms(sync_ms(t)) + ")");
+            (s.limit >= 0 ? " (limit " + std::to_string(s.limit) + ")" : "") + " (" + fmt_ms(sms) + ")");
+      res.stages.push_back(make_stat(StageOp::Sort, "", static_cast<double>(scope->n), 0,
+                                     static_cast<double>(k), static_cast<int>(keys.size()), 0, sms));
     } else {
       k = std::min<size_t>(k, static_cast<size_t>(s.limit));
       perm.allocate(k);
@@ -1087,6 +1171,7 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
   // ---- projection + download ----
   res.nrows = scope->n;
   Timer td;
+  const double up0p = ctx.upload_ms;
   for (auto& it : s.items) {
     DVP v = d_eval(*it.e, *scope);
     res.cols.push_back(download(v, res.nrows));
@@ -1094,9 +1179,15 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
     res.names.push_back(name);
   }
   WDB_CUDA_CHECK(cudaDeviceSynchronize());
-  trace("gpu result download: " + std::to_string(res.nrows) + " rows (" + fmt_ms(td.ms()) + ")");
-  if (ctx.upload_bytes)
+  const double pms = td.ms() - (ctx.upload_ms - up0p);
+  trace("gpu projection + result download: " + std::to_string(res.nrows) + " rows (" + fmt_ms(pms) + ")");
+  res.stages.push_back(make_stat(StageOp::Project, "", static_cast<double>(res.nrows), 0,
+                                 static_cast<double>(res.nrows), static_cast<int>(s.items.size()), 0, pms));
+  if (ctx.upload_bytes) {
     trace("gpu column upload (cold): " + std::to_string(ctx.upload_bytes >> 20) + " MB in " + fmt_ms(ctx.upload_ms));
+    res.stages.push_back(make_stat(StageOp::Upload, "columns", static_cast<double>(ctx.upload_bytes) / 1e6, 0, 0, 0, 0,
+                                   ctx.upload_ms));
+  }
   auto& al = GpuAllocator::instance();
   trace("gpu memory: peak " + std::to_string(al.peak() >> 20) + " MB, column cache " +
         std::to_string(impl_->cache.used() >> 20) + " MB");

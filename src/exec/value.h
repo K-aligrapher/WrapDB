@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,5 +44,12 @@ VP materialize(const VP& v, size_t n);  // broadcast scalars to n rows
 std::vector<uint32_t> select_true(const Value& b);
 std::string format_cell(const Value& v, size_t row);
 bool like_match(const std::string& s, const std::string& pattern);  // SQL LIKE with % and _
+
+// String predicates (=, <, IN, LIKE ...) are evaluated once per dictionary entry. The resulting per-code
+// masks are cached by (column, predicate text), so repeated queries - and the optimizer's sampling pass -
+// do not rescan large dictionaries.
+std::shared_ptr<const std::vector<uint8_t>> cached_dict_mask(
+    uint64_t col_uid, const std::string& key, size_t dict_size,
+    const std::function<void(std::vector<uint8_t>&)>& fill);
 
 }  // namespace warpdb

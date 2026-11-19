@@ -1,6 +1,8 @@
 #include <cmath>
+#include <mutex>
 #include <numeric>
 #include <set>
+#include <unordered_map>
 
 #include "exec/value.h"
 
@@ -130,7 +132,8 @@ VP mask_to_bool(const Value& s, const std::vector<uint8_t>& mask, size_t n) {
 
 VP cmp_str_lit(Op op, const Value& s, const std::string& lit, size_t n) {
   const auto& d = s.dict->dict;
-  std::vector<uint8_t> mask(d.size());
+  auto mask_p = cached_dict_mask(s.dict->uid, "cmp" + std::to_string(static_cast<int>(op)) + "|" + lit, d.size(),
+                                 [&](std::vector<uint8_t>& mask) {
   for (size_t k = 0; k < d.size(); ++k) {
     int c = d[k].compare(lit);
     bool r = false;
@@ -145,7 +148,8 @@ VP cmp_str_lit(Op op, const Value& s, const std::string& lit, size_t n) {
     }
     mask[k] = r;
   }
-  return mask_to_bool(s, mask, n);
+  });
+  return mask_to_bool(s, *mask_p, n);
 }
 
 VP compare(Op op, const Value& a, const Value& b, size_t n) {
@@ -205,6 +209,25 @@ VP bool_not(VP v, size_t n) { return negate(*v, n); }
 }  // namespace
 
 bool like_match(const std::string& s, const std::string& pattern) { return like_match_impl(s, pattern); }
+
+std::shared_ptr<const std::vector<uint8_t>> cached_dict_mask(
+    uint64_t col_uid, const std::string& key, size_t dict_size,
+    const std::function<void(std::vector<uint8_t>&)>& fill) {
+  static std::unordered_map<std::string, std::shared_ptr<const std::vector<uint8_t>>> cache;
+  static std::mutex mu;
+  std::string full = std::to_string(col_uid) + "#" + key;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    auto it = cache.find(full);
+    if (it != cache.end()) return it->second;
+  }
+  auto m = std::make_shared<std::vector<uint8_t>>(dict_size);
+  fill(*m);
+  std::lock_guard<std::mutex> g(mu);
+  if (cache.size() > 512) cache.clear();  // bounded: masks are small, but queries are unbounded
+  cache[full] = m;
+  return m;
+}
 
 // ---------------------------------------------------------------------------------------------
 VP gather_column(const std::shared_ptr<Column>& c, const std::vector<uint32_t>& rid) {
@@ -408,9 +431,12 @@ VP eval(const Expr& e, Scope& sc) {
           set.insert(it->lit);
         }
         const auto& d = x->dict->dict;
-        std::vector<uint8_t> mask(d.size());
-        for (size_t k = 0; k < d.size(); ++k) mask[k] = set.count(d[k]) != 0;
-        r = mask_to_bool(*x, mask, n);
+        std::string key = "in";
+        for (auto& v : set) key += "|" + v;
+        auto mask = cached_dict_mask(x->dict->uid, key, d.size(), [&](std::vector<uint8_t>& m) {
+          for (size_t k = 0; k < d.size(); ++k) m[k] = set.count(d[k]) != 0;
+        });
+        r = mask_to_bool(*x, *mask, n);
       } else {
         for (size_t k = 1; k < e.args.size(); ++k) {
           VP c = compare(Op::Eq, *x, *eval(*e.args[k], sc), n);
@@ -424,9 +450,10 @@ VP eval(const Expr& e, Scope& sc) {
       VP x = eval(*e.args[0], sc), p = eval(*e.args[1], sc);
       if (x->kind != Value::S || p->kind != Value::L) throw Error("LIKE requires a VARCHAR column and a string pattern");
       const auto& d = x->dict->dict;
-      std::vector<uint8_t> mask(d.size());
-      for (size_t k = 0; k < d.size(); ++k) mask[k] = like_match_impl(d[k], p->lit);
-      VP r = mask_to_bool(*x, mask, n);
+      auto mask = cached_dict_mask(x->dict->uid, "like|" + p->lit, d.size(), [&](std::vector<uint8_t>& m) {
+        for (size_t k = 0; k < d.size(); ++k) m[k] = like_match_impl(d[k], p->lit);
+      });
+      VP r = mask_to_bool(*x, *mask, n);
       return e.negated ? bool_not(r, n) : r;
     }
     case Expr::Case: {

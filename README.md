@@ -3,7 +3,17 @@
 A from-scratch GPU SQL engine (C++/CUDA, no libcudf) with JIT-fused pipelines and a
 residency-aware CPU/GPU placement optimizer. See [docs/PRD.md](docs/PRD.md).
 
-**Status:** Phase 3 — SQL executes on the GPU. `.device gpu` in the CLI runs the same queries with CUDA kernels
+**Status:** Phase 4 — cost-based CPU/GPU placement. `.device auto` picks, per query, the device with the lower
+predicted cost: a calibrated model `time = a + b * work` per (stage, device), cardinalities from sampling and NDV
+sketches, and the PCIe upload cost of every column that is not already resident in VRAM. `EXPLAIN <query>` prints the
+per-stage estimate for both devices and the decision without executing; `EXPLAIN ANALYZE` also runs it. The model is
+calibrated once per machine (~3 s, cached in `%LOCALAPPDATA%\warpdb\profile.json`) and keeps learning from every query.
+Evaluation against an oracle (best of forced CPU / forced GPU) on TPC-H SF0.01 / 0.1 / 1, warm and cold
+([docs/PLACEMENT_EVAL.md](docs/PLACEMENT_EVAL.md)): **95% hit rate, 97% on high-stakes decisions, 100% at SF1 with
+8-9% mean regret**; a whole workload runs 8.9x faster than always-CPU and 16% faster than always-GPU.
+`.\.venv\Scripts\python tests\eval_placement.py`. CLI: `.calibrate`, `.model`, `.decisions`.
+
+**Phase 3** — SQL executes on the GPU. `.device gpu` in the CLI runs the same queries with CUDA kernels
 (scan+filter, hash join, hash aggregate, radix sort, top-k) on top of a caching GPU allocator and a VRAM column cache.
 All 31 differential queries match DuckDB on the GPU at SF0.1 and SF1. TPC-H SF1 (warm, columns resident in VRAM):
 geomean **7.1 ms** on the GPU vs 190 ms on the CPU path (26.7x) vs 54 ms for DuckDB (7.6x) —

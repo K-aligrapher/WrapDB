@@ -48,7 +48,8 @@ struct OrderItem {
 };
 
 struct Select {
-  bool explain = false;
+  bool explain = false;   // EXPLAIN: show the placement estimate without executing
+  bool analyze = false;   // EXPLAIN ANALYZE: execute and show estimates next to measurements
   bool distinct = false;
   bool star = false;
   std::vector<SelectItem> items;

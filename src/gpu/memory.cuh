@@ -151,11 +151,18 @@ class ColumnCache {
   uint64_t uploaded_bytes() const { return uploaded_; }
   void begin_query() { ++clock_; }
 
-  bool resident(const Column& c) const { return map_.count(&c) != 0; }
+  bool resident(const Column& c) const { return map_.count(c.uid) != 0; }
+  bool resident_uid(uint64_t uid) const { return map_.count(uid) != 0; }
+  void erase(uint64_t uid) {
+    auto it = map_.find(uid);
+    if (it == map_.end()) return;
+    used_ -= it->second.bytes;
+    map_.erase(it);
+  }
 
   // Device pointer to the column's data (int32* / int64* / double* depending on type), uploading if needed.
   const void* get(const Column& c) {
-    auto it = map_.find(&c);
+    auto it = map_.find(c.uid);
     if (it != map_.end()) {
       it->second.stamp = clock_;
       return it->second.buf.data();
@@ -175,7 +182,7 @@ class ColumnCache {
     e.stamp = clock_;
     used_ += bytes;
     uploaded_ += bytes;
-    auto& slot = map_.emplace(&c, std::move(e)).first->second;
+    auto& slot = map_.emplace(c.uid, std::move(e)).first->second;
     return slot.buf.data();
   }
 
@@ -204,7 +211,7 @@ class ColumnCache {
     map_.erase(victim);
     return true;
   }
-  std::unordered_map<const Column*, Entry> map_;
+  std::unordered_map<uint64_t, Entry> map_;  // keyed by Column::uid (never by address)
   size_t budget_ = 0, used_ = 0;
   uint64_t clock_ = 1, uploaded_ = 0;
 };

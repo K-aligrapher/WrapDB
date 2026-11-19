@@ -102,7 +102,9 @@ class Warp:
             if not l:
                 raise RuntimeError("warpdb exited unexpectedly:\n" + "".join(out))
             if l.startswith("@@END"):
-                return "".join(out), float(l.split()[1])
+                parts = l.split()
+                self.last_device = parts[2] if len(parts) > 2 else ""
+                return "".join(out), float(parts[1])
             if l.startswith("@@ERR"):
                 raise RuntimeError(l[6:].strip())
             out.append(l)
@@ -169,7 +171,7 @@ def main():
     ap.add_argument("--sf", type=float, default=0.1)
     ap.add_argument("--exe", default=os.path.join(ROOT, "build", "release", "warpdb.exe"))
     ap.add_argument("-k", default="", help="only run queries whose name contains this")
-    ap.add_argument("--device", default="cpu", choices=["cpu", "gpu"], help="WarpDB execution device")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "gpu", "auto"], help="WarpDB execution device")
     args = ap.parse_args()
 
     ddir = os.path.join(ROOT, "data", f"tpch_sf{args.sf}")
@@ -191,9 +193,9 @@ def main():
         text, _ = w.run(f".load {t} {os.path.join(ddir, t + '.csv')}")
         print("  " + text.strip())
     print(f"loaded in {time.time() - t0:.1f}s\n")
-    if args.device == "gpu":
-        w.run(".device gpu")
-        print("executing on the GPU (each query runs twice; the second, warm run is timed)\n")
+    if args.device in ("gpu", "auto"):
+        w.run(f".device {args.device}")
+        print(f"device = {args.device} (each query runs twice; the second, warm run is timed)\n")
 
     failed = 0
     ran = 0
@@ -207,8 +209,8 @@ def main():
             t = time.time()
             duck_rows = duck.execute(sql).fetchall()
             dms = (time.time() - t) * 1000
-            if args.device == "gpu":
-                w.query(sql)  # cold run: uploads the needed columns to VRAM
+            if args.device in ("gpu", "auto"):
+                w.query(sql)  # first run: uploads the needed columns / lets the optimizer see the query
             _, wrows, wms = w.query(sql)
             err = compare(wrows, duck_rows, ordered)
         except Exception as e:  # noqa: BLE001

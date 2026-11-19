@@ -23,7 +23,12 @@ class GpuBackend : public Backend {
   QueryResult execute(Engine& eng, PlannedQuery& pq) override;
 
   GpuMemStats mem_stats() const;
-  void drop_cache();  // evict all resident columns (to measure cold queries)
+  void drop_cache() override;  // evict all resident columns (to measure cold queries)
+  bool column_resident(const Column& c) const override;
+  size_t cache_budget_bytes() const override;
+  void forget_columns(const std::vector<uint64_t>& uids) override;
+  std::string fingerprint() const override;
+  bool measure_hardware(HwProfile& hw) override;
 
  private:
   struct Impl;

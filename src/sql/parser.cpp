@@ -159,7 +159,7 @@ class Parser {
     if (kw("explain")) {
       ++p_;
       s.explain = true;
-      if (kw("analyze")) ++p_;
+      if (kw("analyze")) { ++p_; s.analyze = true; }
     }
     expect_kw("select");
     if (kw("distinct")) { ++p_; s.distinct = true; }

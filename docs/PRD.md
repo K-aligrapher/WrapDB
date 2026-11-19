@@ -4,6 +4,17 @@
 
 ---
 
+## Implementation status (2026-11-20)
+
+| Phase | Status | Notes |
+|---|---|---|
+| P0 Setup | done | native Windows: MSVC + CUDA 13.2 + CMake/Ninja |
+| P1 Storage + CPU engine | done | 31 DuckDB-differential queries |
+| P2 GPU primitives | done | scan = CUB parity; select >= CUB; radix sort 0.65-0.86x CUB; hash table 7-10x sort-based |
+| P3 GPU operators | done | TPC-H SF1 warm geomean 7.1 ms (26.7x CPU path, 7.6x DuckDB) |
+| P4 Placement optimizer | done | per-**query** placement from per-**operator** cost estimates; calibrated, residency-aware, online-learning. Mixed CPU/GPU execution inside one query is not implemented |
+| P5-P9 | pending | dashboard, JIT fusion, out-of-core streaming, fuzzing, polish |
+
 ## 1. One-line pitch
 
 A small analytical SQL engine, written in C++/CUDA with no libcudf, that runs filters, joins, aggregations and sorts in **hand-written GPU kernels**. Its own **JIT kernel compiler** fuses whole query pipelines into a single kernel. A **learned, operator-level CPU/GPU placement optimizer** accounts for where the data currently lives and what the PCIe transfer costs. Every query can be inspected in a live "flight recorder" dashboard.

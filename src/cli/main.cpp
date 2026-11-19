@@ -1,6 +1,7 @@
 #include <io.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -32,7 +33,11 @@ std::string csv_escape(const std::string& s) {
 
 void print_result(const QueryResult& r, const Settings& st) {
   if (r.explain) {
-    for (auto& l : r.trace) std::printf("  %s\n", l.c_str());
+    for (auto& l : r.plan_lines) std::printf("%s\n", l.c_str());
+    if (!r.trace.empty()) {
+      std::printf("execution (%s):\n", r.device_used.c_str());
+      for (auto& l : r.trace) std::printf("  %s\n", l.c_str());
+    }
     return;
   }
   const size_t nc = r.cols.size();
@@ -92,7 +97,10 @@ const char* HELP =
     "  .mode csv|table                           output format\n"
     "  .timer on|off                             show timings\n"
     "  .gpu                                      show GPU info\n"
-    "  .device cpu|gpu                           choose where queries execute\n"
+    "  .device cpu|gpu|auto                      where queries execute (auto = cost-based placement)\n"
+    "  .calibrate                                re-measure this machine and refit the cost model\n"
+    "  .model                                    show the fitted cost model (a + b*work per stage and device)\n"
+    "  .decisions                                audit log of automatic placement decisions\n"
     "  .gpustats                                 GPU memory / column-cache statistics\n"
     "  .dropcache                                evict resident GPU columns (next GPU query runs cold)\n"
     "  .quit                                     exit\n"
@@ -106,10 +114,43 @@ bool run_command(Engine& eng, Settings& st, const std::string& line) {
   const std::string& c = a[0];
   if (c == ".quit" || c == ".exit") return false;
   if (c == ".device") {
-    if (a.size() < 2 || (a[1] != "cpu" && a[1] != "gpu")) throw Error("usage: .device cpu|gpu");
+    if (a.size() < 2 || (a[1] != "cpu" && a[1] != "gpu" && a[1] != "auto")) throw Error("usage: .device cpu|gpu|auto");
     if (a[1] == "gpu" && !g_gpu) throw Error("no CUDA device available");
     eng.device = a[1];
     std::printf("device = %s\n", eng.device.c_str());
+    return true;
+  }
+  if (c == ".calibrate") {
+    eng.calibrate();
+    return true;
+  }
+  if (c == ".model") {
+    eng.ensure_calibrated();
+    const auto& hw = eng.cost.hw;
+    std::printf("hardware: %s\n", hw.fingerprint.c_str());
+    if (hw.has_gpu)
+      std::printf("  PCIe H2D %.1f GB/s, D2H %.1f GB/s, kernel launch+sync %.1f us, VRAM copy %.0f GB/s\n", hw.h2d_gbs,
+                  hw.d2h_gbs, hw.launch_us, hw.gpu_membw_gbs);
+    std::printf("  %-10s %-6s %12s %16s %8s\n", "stage", "device", "a (ms)", "b (ms/unit)", "samples");
+    for (int op = 0; op < kNumStageOps; ++op)
+      for (int g = 0; g < 2; ++g) {
+        if (g && !hw.has_gpu) continue;
+        const auto& m = eng.cost.model(static_cast<StageOp>(op), g != 0);
+        std::printf("  %-10s %-6s %12.4f %16.4g %8zu\n", stage_op_name(static_cast<StageOp>(op)), g ? "gpu" : "cpu",
+                    m.a(), m.b(), m.samples());
+      }
+    return true;
+  }
+  if (c == ".decisions") {
+    std::printf("%-4s %-6s %10s %10s %10s %10s  %s\n", "#", "chose", "est cpu", "est gpu", "actual", "decide ms", "query");
+    size_t from = eng.decisions.size() > 25 ? eng.decisions.size() - 25 : 0;
+    for (size_t i = from; i < eng.decisions.size(); ++i) {
+      const auto& d = eng.decisions[i];
+      std::string q = d.sql.substr(0, 60);
+      for (auto& ch : q) if (ch == '\n') ch = ' ';
+      std::printf("%-4zu %-6s %10.2f %10.2f %10.2f %10.3f  %s\n", i, d.chosen.c_str(), d.est_cpu_ms, d.est_gpu_ms,
+                  d.actual_ms, d.decide_ms, q.c_str());
+    }
     return true;
   }
   if (c == ".gpustats" || c == ".dropcache") {
@@ -190,6 +231,11 @@ int main(int argc, char** argv) {
       }
     }
   }
+  {
+    const char* appdata = std::getenv("LOCALAPPDATA");
+    eng.profile_path = appdata ? std::string(appdata) + "\\warpdb\\profile.json" : ".warpdb_profile.json";
+    if (!st.protocol) eng.on_notice = [](const std::string& m) { std::printf("[warpdb] %s\n", m.c_str()); std::fflush(stdout); };
+  }
   const bool tty = _isatty(_fileno(stdin)) != 0;
   if (tty && once.empty())
     std::printf("WarpDB v0.1 (%s) - type .help for help\n", g_gpu ? "CPU + GPU engines; .device gpu to use the GPU" : "CPU engine");
@@ -198,8 +244,8 @@ int main(int argc, char** argv) {
     try {
       QueryResult r = eng.execute(sql);
       print_result(r, st);
-      if (st.timer && !r.explain) std::printf("(%.2f ms)\n", r.ms);
-      if (st.protocol) std::printf("@@END %.3f\n", r.ms);
+      if (st.timer && !r.explain) std::printf("(%.2f ms on %s)\n", r.ms, r.device_used.c_str());
+      if (st.protocol) std::printf("@@END %.3f %s\n", r.ms, r.device_used.c_str());
     } catch (const std::exception& e) {
       if (st.protocol) std::printf("@@ERR %s\n", e.what());
       else std::printf("error: %s\n", e.what());

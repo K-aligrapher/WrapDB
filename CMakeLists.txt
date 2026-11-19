@@ -33,7 +33,10 @@ add_library(warpdb_core STATIC
   src/storage/csv.cpp
   src/sql/parser.cpp
   src/exec/eval.cpp
-  src/exec/engine.cpp)
+  src/exec/engine.cpp
+  src/exec/placement.cpp
+  src/exec/calibrate.cpp
+  src/optimizer/cost_model.cpp)
 target_include_directories(warpdb_core PUBLIC src)
 if(MSVC)
   target_compile_options(warpdb_core PRIVATE /W3 /O2 /EHsc)
@@ -59,7 +62,7 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
-add_executable(warpdb_tests tests/test_device.cpp tests/test_sql.cpp tests/test_gpu_prims.cu tests/test_gpu_engine.cu)
+add_executable(warpdb_tests tests/test_device.cpp tests/test_sql.cpp tests/test_gpu_prims.cu tests/test_gpu_engine.cu tests/test_optimizer.cpp)
 target_link_libraries(warpdb_tests PRIVATE warpdb_core warpdb_gpu GTest::gtest_main)
 include(GoogleTest)
 gtest_discover_tests(warpdb_tests)
