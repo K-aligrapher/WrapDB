@@ -1,0 +1,14 @@
+.venv/
+build/
+.qodo/
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+*.obj
+*.ilk
+*.pdb
+# generated datasets / traces
+data/
+*.wcol
+traces/
