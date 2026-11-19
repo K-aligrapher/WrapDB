@@ -8,6 +8,7 @@
 // select_threepass: the textbook flags -> scan -> scatter pipeline, kept as a baseline to quantify the
 // benefit of fusion.
 #include "gpu/prims/scan.cuh"
+#include "gpu/prims/select_tile.cuh"
 
 namespace warpdb::gpu {
 
@@ -38,41 +39,7 @@ constexpr int SEL_ITEMS = 16;  // per thread; tile = 4096 elements
 template <int BLOCK, int ITEMS, class Gen, class Out>
 __global__ void __launch_bounds__(BLOCK) select_kernel(Gen gen, size_t n, Out* __restrict__ out, uint64_t* status,
                                                        uint32_t* counter, uint32_t last_tile, uint32_t* d_count) {
-  __shared__ uint32_t s_tile;
-  if (threadIdx.x == 0) s_tile = atomicAdd(counter, 1u);
-  __syncthreads();
-  const uint32_t tile = s_tile;
-  const uint32_t lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  // Warp-striped layout: iteration k of a warp covers 32 consecutive elements -> perfectly coalesced
-  // loads, and (k, lane) order == input order, so ranking by ballot keeps the output stable.
-  const size_t wbase = static_cast<size_t>(tile) * BLOCK * ITEMS + static_cast<size_t>(warp) * 32 * ITEMS;
-
-  uint32_t ballots[ITEMS];
-  Out vals[ITEMS];
-  uint32_t warp_count = 0;
-#pragma unroll
-  for (int k = 0; k < ITEMS; ++k) {
-    size_t i = wbase + static_cast<size_t>(k) * 32 + lane;
-    bool keep = false;
-    if (i < n) keep = gen.eval(i, vals[k]);
-    ballots[k] = __ballot_sync(FULL_MASK, keep);
-    warp_count += __popc(ballots[k]);
-  }
-
-  // block-level: exclusive scan of per-warp counts, then publish + look-back (warp 0)
-  // Only lane 0 contributes the warp's count, so the block scan below is a scan over warps; lane 0's
-  // exclusive offset is then the warp's offset inside the tile.
-  uint32_t excl_in_block, tile_prefix, tile_total;
-  block_tile_scan<BLOCK>(lane == 0 ? warp_count : 0u, tile, status, last_tile, d_count, excl_in_block, tile_prefix,
-                         tile_total);
-  uint32_t warp_off = __shfl_sync(FULL_MASK, excl_in_block, 0);
-  uint32_t pos = tile_prefix + warp_off;
-  const uint32_t lt = (1u << lane) - 1u;
-#pragma unroll
-  for (int k = 0; k < ITEMS; ++k) {
-    if (ballots[k] & (1u << lane)) out[pos + __popc(ballots[k] & lt)] = vals[k];
-    pos += __popc(ballots[k]);
-  }
+  select_tile<BLOCK, ITEMS, Gen, Out>(gen, n, out, status, counter, last_tile, d_count);
 }
 
 template <class T>

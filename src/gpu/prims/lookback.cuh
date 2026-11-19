@@ -8,9 +8,7 @@
 // A tile finds its exclusive prefix by walking backwards over predecessors (a warp at a time) until it
 // meets a P. Tiles take work via an atomic ticket, so every tile a block waits on is already resident
 // -> no deadlock regardless of scheduling order.
-#include <cstdint>
-
-#include "gpu/cuda_util.cuh"
+#include "gpu/prims/device_defs.cuh"
 
 namespace warpdb::gpu::detail {
 

@@ -13,7 +13,9 @@
 | P2 GPU primitives | done | scan = CUB parity; select >= CUB; radix sort 0.65-0.86x CUB; hash table 7-10x sort-based |
 | P3 GPU operators | done | TPC-H SF1 warm geomean 7.1 ms (26.7x CPU path, 7.6x DuckDB) |
 | P4 Placement optimizer | done | per-**query** placement from per-**operator** cost estimates; calibrated, residency-aware, online-learning. Mixed CPU/GPU execution inside one query is not implemented |
-| P5-P9 | pending | dashboard, JIT fusion, out-of-core streaming, fuzzing, polish |
+| P5 Python + dashboard | done | pybind11 module `warpdb` (pandas results, estimates, residency, JIT stats), Streamlit dashboard, 18 Python tests incl. headless UI tests. Kernel-level CUDA timeline not built: the dashboard shows a stage-level timeline |
+| P6 JIT fusion | done | NVRTC fused filter->compact and scan->filter->group->aggregate pipelines; memory + disk CUBIN cache; 1.61x geomean over unfused (TPC-H SF1). Joins are not yet fused |
+| P7-P9 | pending | out-of-core streaming + compression, learned-model/fuzzing, polish |
 
 ## 1. One-line pitch
 

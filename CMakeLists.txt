@@ -23,7 +23,12 @@ add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
                     $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=177>)  # 177: unused gtest members
 
 # ---- core library ----
-add_library(warpdb_gpu STATIC src/gpu/device.cu src/gpu/hello_kernel.cu src/gpu/gpu_backend.cu)
+find_package(CUDAToolkit REQUIRED)
+add_library(warpdb_gpu STATIC src/gpu/device.cu src/gpu/hello_kernel.cu src/gpu/gpu_backend.cu
+  src/gpu/jit/jit.cu src/gpu/jit/codegen.cpp)
+# JIT-generated kernels #include the device-only headers from src/ through NVRTC at run time
+target_compile_definitions(warpdb_gpu PRIVATE WARPDB_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
+target_link_libraries(warpdb_gpu PUBLIC CUDA::nvrtc CUDA::cuda_driver)
 target_include_directories(warpdb_gpu PUBLIC src)
 set_target_properties(warpdb_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 target_link_libraries(warpdb_gpu PUBLIC warpdb_core)
@@ -46,6 +51,28 @@ endif()
 add_executable(warpdb src/cli/main.cpp)
 target_link_libraries(warpdb PRIVATE warpdb_core warpdb_gpu)
 
+# ---- Python module (pybind11): `import warpdb` from python/ ----
+find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
+if(Python3_FOUND)
+  execute_process(COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+                  OUTPUT_VARIABLE WARPDB_PYBIND11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _pyb_rc)
+  if(_pyb_rc EQUAL 0)
+    find_package(pybind11 CONFIG QUIET PATHS "${WARPDB_PYBIND11_DIR}" NO_DEFAULT_PATH)
+  endif()
+endif()
+if(pybind11_FOUND)
+  pybind11_add_module(_warpdb MODULE src/python/bindings.cpp)
+  target_link_libraries(_warpdb PRIVATE warpdb_core warpdb_gpu)
+  set_target_properties(_warpdb PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/python/warpdb"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/python/warpdb"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/python/warpdb"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/python/warpdb")
+  message(STATUS "Python module _warpdb enabled (pybind11 ${pybind11_VERSION})")
+else()
+  message(STATUS "pybind11 not found: Python module disabled (pip install pybind11)")
+endif()
+
 # ---- GPU micro-benchmarks (WarpDB primitives vs CUB; CUB is a reference only) ----
 add_executable(warpdb_bench bench/bench_gpu.cu)
 target_include_directories(warpdb_bench PRIVATE src)
@@ -62,7 +89,7 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
-add_executable(warpdb_tests tests/test_device.cpp tests/test_sql.cpp tests/test_gpu_prims.cu tests/test_gpu_engine.cu tests/test_optimizer.cpp)
+add_executable(warpdb_tests tests/test_device.cpp tests/test_sql.cpp tests/test_gpu_prims.cu tests/test_gpu_engine.cu tests/test_optimizer.cpp tests/test_jit.cu)
 target_link_libraries(warpdb_tests PRIVATE warpdb_core warpdb_gpu GTest::gtest_main)
 include(GoogleTest)
 gtest_discover_tests(warpdb_tests)

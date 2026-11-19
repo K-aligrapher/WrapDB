@@ -2,6 +2,7 @@
 #include <memory>
 
 #include "exec/engine.h"
+#include "gpu/jit/jit.h"
 
 namespace warpdb::gpu {
 
@@ -29,6 +30,14 @@ class GpuBackend : public Backend {
   void forget_columns(const std::vector<uint64_t>& uids) override;
   std::string fingerprint() const override;
   bool measure_hardware(HwProfile& hw) override;
+
+  // JIT pipeline fusion (NVRTC). Falls back to the interpreted kernels whenever it is unavailable or unsupported.
+  void set_jit(bool on);
+  bool jit_enabled() const;             // requested AND NVRTC usable
+  void set_jit_min_rows(size_t n);      // compile unseen kernels only for inputs at least this large
+  size_t jit_min_rows() const;
+  JitStats jit_stats() const;
+  void set_jit_force_capacity_for_test(size_t cap);  // 0 = size group tables from estimates (default)
 
  private:
   struct Impl;

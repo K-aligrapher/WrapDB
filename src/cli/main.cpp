@@ -102,6 +102,7 @@ const char* HELP =
     "  .model                                    show the fitted cost model (a + b*work per stage and device)\n"
     "  .decisions                                audit log of automatic placement decisions\n"
     "  .gpustats                                 GPU memory / column-cache statistics\n"
+    "  .jit on|off|stats|minrows N               NVRTC pipeline fusion on the GPU (kernels are compiled once, then cached)\n"
     "  .dropcache                                evict resident GPU columns (next GPU query runs cold)\n"
     "  .quit                                     exit\n"
     "SQL: SELECT ... FROM ... [JOIN ... ON ...] [WHERE] [GROUP BY] [HAVING] [ORDER BY] [LIMIT]; prefix with EXPLAIN to see the execution trace.\n";
@@ -151,6 +152,21 @@ bool run_command(Engine& eng, Settings& st, const std::string& line) {
       std::printf("%-4zu %-6s %10.2f %10.2f %10.2f %10.3f  %s\n", i, d.chosen.c_str(), d.est_cpu_ms, d.est_gpu_ms,
                   d.actual_ms, d.decide_ms, q.c_str());
     }
+    return true;
+  }
+  if (c == ".jit") {
+    if (!g_gpu) throw Error("no CUDA device available");
+    if (a.size() > 1 && a[1] == "on") g_gpu->set_jit(true);
+    else if (a.size() > 1 && a[1] == "off") g_gpu->set_jit(false);
+    else if (a.size() > 2 && a[1] == "minrows") g_gpu->set_jit_min_rows(static_cast<size_t>(std::stoull(a[2])));
+    else if (a.size() > 1 && a[1] == "stats") {
+      auto s = g_gpu->jit_stats();
+      std::printf("jit: %zu compiles (%.0f ms in NVRTC), %zu in-memory hits, %zu disk-cache hits (%.1f ms loading), %zu failures\n",
+                  s.compiles, s.compile_ms, s.mem_hits, s.disk_hits, s.load_ms, s.failures);
+      return true;
+    } else if (a.size() > 1) throw Error("usage: .jit on|off|stats|minrows N");
+    std::printf("jit %s (compile unseen kernels for inputs >= %zu rows)\n", g_gpu->jit_enabled() ? "enabled" : "disabled",
+                g_gpu->jit_min_rows());
     return true;
   }
   if (c == ".gpustats" || c == ".dropcache") {

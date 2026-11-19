@@ -3,7 +3,29 @@
 A from-scratch GPU SQL engine (C++/CUDA, no libcudf) with JIT-fused pipelines and a
 residency-aware CPU/GPU placement optimizer. See [docs/PRD.md](docs/PRD.md).
 
-**Status:** Phase 4 — cost-based CPU/GPU placement. `.device auto` picks, per query, the device with the lower
+**Status:** Phases 5-6 — Python layer, dashboard, and JIT pipeline fusion.
+
+```python
+import sys; sys.path.insert(0, "python")
+import warpdb
+db = warpdb.connect()                 # CPU + GPU, cost-based placement (device="auto")
+db.load_tpch(sf=1)                    # generates CSVs with DuckDB on first use
+res = db.sql("select l_returnflag, sum(l_quantity) from lineitem group by l_returnflag")
+res.to_pandas(), res.ms, res.device, res.stages     # pandas result + how it ran
+print(db.explain("select ..."))       # per-stage CPU/GPU cost estimate and the decision
+```
+`.un_dashboard.ps1` starts the Streamlit dashboard: run SQL with a stage timeline, inspect the optimizer's per-stage
+CPU/GPU estimates and decision log (predicted vs actual), watch VRAM residency / allocator / JIT cache, A/B the JIT, and
+run live benchmarks against DuckDB. Tests: `.\.venv\Scripts\python -m pytest tests` (Python API + headless dashboard).
+
+**JIT fusion** (NVRTC): whole pipelines compile to ONE kernel at run time — `filter -> compact`, and
+`scan -> filter -> group keys -> hash-table slot -> every aggregate update` — reading base columns directly. The generated
+code reuses the same hand-written device primitives (look-back scan, warp-ballot compaction, group table), is cached in
+memory and on disk (CUBIN), and falls back to the interpreted kernels for anything unsupported. TPC-H SF1 warm GPU:
+**1.61x geomean (up to 3.1x)** over the unfused kernels; 30-530 ms one-off compile, ~1-30 ms when loaded from the disk
+cache ([docs/BENCHMARKS_JIT.md](docs/BENCHMARKS_JIT.md)). `.jit on|off|stats` in the CLI; `python tests/bench_jit.py`.
+
+**Phase 4** — cost-based CPU/GPU placement. `.device auto` picks, per query, the device with the lower
 predicted cost: a calibrated model `time = a + b * work` per (stage, device), cardinalities from sampling and NDV
 sketches, and the PCIe upload cost of every column that is not already resident in VRAM. `EXPLAIN <query>` prints the
 per-stage estimate for both devices and the decision without executing; `EXPLAIN ANALYZE` also runs it. The model is

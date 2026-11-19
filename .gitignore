@@ -12,3 +12,8 @@ __pycache__/
 data/
 *.wcol
 traces/
+*.pyd
+.pytest_cache/
+st_*.txt
+gtest_*.txt
+.streamlit/

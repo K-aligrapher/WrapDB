@@ -4,11 +4,14 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <unordered_map>
 
 #include "exec/value.h"
 #include "gpu/gpu_backend.h"
+#include "gpu/jit/codegen.h"
+#include "gpu/jit/jit.h"
 #include "gpu/op_kernels.cuh"
 
 namespace warpdb::gpu {
@@ -922,11 +925,295 @@ VP download(const DVP& vin, size_t n) {
   return o;
 }
 
+// ------------------------------------------------------------------------------------------------
+// JIT fusion: whole pipelines compiled to one kernel (see gpu/jit/codegen.h).
+// ------------------------------------------------------------------------------------------------
+struct JitCtx {
+  bool enabled = false;
+  size_t min_rows = 200000;  // below this a not-yet-cached kernel is not worth an NVRTC compile
+  size_t force_cap = 0;      // test hook: start fused group tables at this capacity to exercise overflow retry
+  std::vector<std::string> notes;
+  double compile_ms = 0;  // NVRTC / module-load time spent so far in this query
+};
+
+std::string group_digits(double v) {
+  std::string s = std::to_string(static_cast<long long>(v)), out;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (i && (s.size() - i) % 3 == 0) out += ',';
+    out += s[i];
+  }
+  return out;
+}
+
+// Device pointer of a base column, uploading it if necessary (upload time is accounted separately).
+const void* jit_col_ptr(GpuCtx& ctx, const Column& col) {
+  const bool was = ctx.cache->resident(col);
+  const uint64_t before = ctx.cache->uploaded_bytes();
+  Timer t;
+  const void* p = ctx.cache->get(col);
+  if (!was) {
+    WDB_CUDA_CHECK(cudaDeviceSynchronize());
+    ctx.upload_ms += t.ms();
+    ctx.upload_bytes += ctx.cache->uploaded_bytes() - before;
+  }
+  return p;
+}
+
+std::vector<GpuVec<uint8_t>> jit_upload_masks(const JitPlan& plan) {
+  std::vector<GpuVec<uint8_t>> out;
+  for (auto& m : plan.masks) {
+    auto hm = cached_dict_mask(m.dictcol->uid, m.key, m.dictcol->dict.size(), m.fill);
+    GpuVec<uint8_t> d(hm->size());
+    d.from_host(hm->data(), hm->size());
+    out.push_back(std::move(d));
+  }
+  return out;
+}
+
+std::shared_ptr<JitKernel> jit_kernel(const JitPlan& plan, size_t rows, JitCtx& jc, const char** origin,
+                                      double* ms) {
+  auto& rt = JitRuntime::instance();
+  if (rows < jc.min_rows && !rt.peek(plan.source, plan.entry))
+    throw JitUnsupported("input is small and the kernel is not cached: compiling would cost more than it saves");
+  auto k = rt.get(plan.source, plan.entry, ms, origin);
+  jc.compile_ms += *ms;  // one-off cost: excluded from the stage times the cost model learns from
+  return k;
+}
+
+std::string jit_origin_note(const char* origin, double compile_ms, double kernel_ms) {
+  std::string o = origin ? origin : "";
+  std::string s = "kernel ";
+  s += fmt_ms(kernel_ms);
+  s += o == "compiled" ? ", NVRTC compile " + fmt_ms(compile_ms) : ", " + o;
+  return s;
+}
+
+// scan + all pushed-down predicates + stream compaction in one kernel. Returns false => use the interpreter.
+bool jit_filter(GpuCtx& ctx, const PlannedQuery& pq, int tbl, JitCtx& jc, Sel& out, double* ms_out) {
+  const auto& preds = pq.push[tbl];
+  const size_t n = pq.tabs[tbl]->nrows;
+  if (!jc.enabled || preds.empty() || n == 0) return false;
+  try {
+    JitPlan plan = gen_filter_plan(pq, tbl, preds);
+    double cms = 0;
+    const char* origin = "";
+    auto kernel = jit_kernel(plan, n, jc, &origin, &cms);
+    auto masks = jit_upload_masks(plan);
+    ArgPack args;
+    args.add<unsigned long long>(n);
+    for (auto& tc : plan.cols) args.add<const void*>(jit_col_ptr(ctx, *pq.tabs[tc.first]->cols[tc.second]));
+    for (auto& m : masks) args.add<const void*>(m.data());
+    const size_t tiles = ceil_div(n, size_t(256) * 16);
+    GpuVec<uint8_t> ws(tiles * 8 + 64);
+    WDB_CUDA_CHECK(cudaMemset(ws.data(), 0, tiles * 8 + 4));
+    out.idx.allocate(n);
+    GpuVec<uint32_t> cnt(1);
+    auto* status = reinterpret_cast<unsigned long long*>(ws.data());
+    auto* counter = reinterpret_cast<unsigned int*>(status + tiles);
+    args.add<void*>(out.idx.data());
+    args.add<void*>(status);
+    args.add<void*>(counter);
+    args.add<unsigned int>(static_cast<unsigned int>(tiles - 1));
+    args.add<void*>(cnt.data());
+    Timer t;
+    JitRuntime::instance().launch(*kernel, static_cast<unsigned>(tiles), 256, args);
+    out.k = cnt.to_host(1)[0];  // synchronizes
+    const double kms = t.ms();
+    if (ms_out) *ms_out = kms;
+    jc.notes.push_back("jit fused filter+compact on " + pq.tabs[tbl]->name + " (" + std::to_string(preds.size()) +
+                       " predicates, " + jit_origin_note(origin, cms, kms) + ")");
+    return true;
+  } catch (const JitUnsupported&) {
+    return false;
+  } catch (const JitError& e) {
+    jc.notes.push_back(std::string("jit filter fell back to interpreter: ") + e.what());
+    return false;
+  }
+}
+
+// Whole post-scan pipeline in one kernel: [filter] -> group keys -> group-table slot -> every aggregate update.
+// `rel == nullptr` means the pipeline scans table `scan_tbl` directly (row i = row i of the table).
+std::optional<AggOutput> jit_aggregate(Engine& eng, const PlannedQuery& pq, GpuCtx& ctx, JitCtx& jc, const DRel* rel,
+                                       int scan_tbl, const std::vector<ExprP>& preds, size_t* kept_out,
+                                       double* kernel_ms_out) {
+  if (!jc.enabled) return std::nullopt;
+  const bool identity = rel == nullptr;
+  const size_t n = identity ? pq.tabs[scan_tbl]->nrows : rel->n;
+  try {
+    std::vector<JAggDesc> descs;
+    for (auto& a : pq.aggs) {
+      JAggDesc d;
+      d.func = a->name == "sum" ? JAgg::Sum : a->name == "count" ? JAgg::Count : a->name == "avg" ? JAgg::Avg
+               : a->name == "min" ? JAgg::Min : JAgg::Max;
+      if (a->args[0]->kind != Expr::Star) d.arg = a->args[0];
+      else if (d.func != JAgg::Count) throw JitUnsupported("* is only valid in count(*)");
+      descs.push_back(d);
+    }
+    std::vector<int> rel_tbls = identity ? std::vector<int>{scan_tbl} : rel->tbls;
+    JitPlan plan = gen_agg_plan(pq, rel_tbls, identity, preds, pq.sel.group_by, descs);
+    double cms = 0;
+    const char* origin = "";
+    auto kernel = jit_kernel(plan, n, jc, &origin, &cms);
+    auto masks = jit_upload_masks(plan);
+
+    // group table sizing: estimated groups among the rows that survive the filters
+    const size_t K = static_cast<size_t>(plan.K), A = static_cast<size_t>(plan.A);
+    double est_n = static_cast<double>(std::max<size_t>(n, 1));
+    if (identity && !preds.empty()) est_n = std::max(1.0, est_n * eng.sample_selectivity(pq, scan_tbl));
+    size_t cap = 1;
+    if (K > 0) {
+      double prod = 1;
+      for (auto& g : pq.sel.group_by) prod *= eng.key_ndv(pq, g, static_cast<size_t>(est_n));
+      double est = std::min(est_n, prod);
+      cap = 16;
+      while (static_cast<double>(cap) < est * 2.0) cap <<= 1;
+      if (jc.force_cap) cap = jc.force_cap;
+    }
+
+    GpuVec<uint32_t> state, overflow(1), kept(1);
+    GpuVec<int64_t> skeys;
+    struct Acc { GpuVec<int64_t> i; GpuVec<double> f; GpuVec<int64_t> cnt; };
+    std::vector<Acc> accs(A);
+    size_t acc_n = 1;
+    double kernel_ms = 0;
+    for (;;) {
+      acc_n = K > 0 ? cap : 1;
+      if (K > 0) {
+        state.allocate(cap);
+        WDB_CUDA_CHECK(cudaMemset(state.data(), 0, cap * 4));
+        skeys.allocate(K * cap);
+      }
+      WDB_CUDA_CHECK(cudaMemset(overflow.data(), 0, 4));
+      WDB_CUDA_CHECK(cudaMemset(kept.data(), 0, 4));
+      for (size_t a = 0; a < A; ++a) {
+        Acc& ac = accs[a];
+        auto init_i = [&](GpuVec<int64_t>& v, int64_t x) {
+          v.allocate(acc_n);
+          ops::fill_k<int64_t><<<ops::grid_for(acc_n), 256>>>(v.data(), acc_n, x);
+        };
+        auto init_f = [&](GpuVec<double>& v, double x) {
+          v.allocate(acc_n);
+          ops::fill_k<double><<<ops::grid_for(acc_n), 256>>>(v.data(), acc_n, x);
+        };
+        const double inf = std::numeric_limits<double>::infinity();
+        switch (plan.aggs[a].func) {
+          case JAgg::Count: init_i(ac.i, 0); break;
+          case JAgg::Sum: if (plan.acc_is_f[a]) init_f(ac.f, 0.0); else init_i(ac.i, 0); break;
+          case JAgg::Avg: init_f(ac.f, 0.0); init_i(ac.cnt, 0); break;
+          case JAgg::Min: if (plan.acc_is_f[a]) init_f(ac.f, inf); else init_i(ac.i, INT64_MAX); break;
+          case JAgg::Max: if (plan.acc_is_f[a]) init_f(ac.f, -inf); else init_i(ac.i, INT64_MIN); break;
+        }
+      }
+      ArgPack args;
+      args.add<unsigned long long>(n);
+      for (auto& tc : plan.cols) args.add<const void*>(jit_col_ptr(ctx, *pq.tabs[tc.first]->cols[tc.second]));
+      if (!identity)
+        for (size_t r = 0; r < rel->rid.size(); ++r) args.add<const void*>(rel->rid[r].data());
+      for (auto& m : masks) args.add<const void*>(m.data());
+      if (K > 0) {
+        args.add<void*>(state.data());
+        args.add<void*>(skeys.data());
+        args.add<unsigned int>(static_cast<unsigned int>(cap));
+        args.add<unsigned int>(static_cast<unsigned int>(cap - 1));
+        args.add<void*>(overflow.data());
+      }
+      for (size_t a = 0; a < A; ++a) {
+        Acc& ac = accs[a];
+        if (plan.acc_is_f[a]) args.add<void*>(ac.f.data());
+        else args.add<void*>(ac.i.data());
+        if (plan.aggs[a].func == JAgg::Avg) args.add<void*>(ac.cnt.data());
+      }
+      args.add<void*>(kept.data());
+      args.add<int>((K == 0 || cap <= 4096) ? 1 : 0);
+      WDB_CUDA_CHECK(cudaDeviceSynchronize());
+      Timer t;
+      JitRuntime::instance().launch(*kernel, static_cast<unsigned>(ceil_div(std::max<size_t>(n, 1), 256)), 256, args);
+      WDB_CUDA_CHECK(cudaDeviceSynchronize());
+      kernel_ms += t.ms();
+      if (K == 0 || overflow.to_host(1)[0] == 0) break;
+      cap <<= 2;  // the group count was underestimated: rebuild a bigger table and rerun
+      if (cap > (size_t(1) << 30)) throw Error("GPU aggregation: too many groups");
+    }
+    if (kept_out) *kept_out = kept.to_host(1)[0];
+    if (kernel_ms_out) *kernel_ms_out = kernel_ms;
+
+    // ---- compact occupied slots, gather keys and accumulators ----
+    AggOutput out;
+    GpuVec<uint32_t> slots;
+    size_t G = 1;
+    if (K > 0) {
+      slots.allocate(cap);
+      GpuVec<uint8_t> ws(select_workspace_bytes(cap));
+      GpuVec<uint32_t> cnt(1);
+      select_fused(ops::StateGen{state.data()}, cap, slots.data(), cnt.data(), ws.data());
+      G = cnt.to_host(1)[0];
+    }
+    out.n = G;
+    for (size_t j = 0; j < K; ++j) {
+      const ValType& kt = plan.key_types[j];
+      auto o = new_dvec(kt.kind == Value::F ? Value::F : (kt.kind == Value::S ? Value::S : Value::I), G);
+      o->is_date = kt.is_date;
+      o->dict = kt.dict;
+      const int64_t* src = skeys.data() + j * cap;
+      if (kt.kind == Value::F) ops::gather<double, double>(reinterpret_cast<const double*>(src), slots.data(), o->f.data(), G);
+      else ops::gather<int64_t, int64_t>(src, slots.data(), o->i.data(), G);
+      out.keys.push_back(o);
+    }
+    auto take_i = [&](const GpuVec<int64_t>& acc) {
+      GpuVec<int64_t> r(G);
+      if (K > 0) ops::gather<int64_t, int64_t>(acc.data(), slots.data(), r.data(), G);
+      else WDB_CUDA_CHECK(cudaMemcpy(r.data(), acc.data(), 8, cudaMemcpyDeviceToDevice));
+      return r;
+    };
+    auto take_f = [&](const GpuVec<double>& acc) {
+      GpuVec<double> r(G);
+      if (K > 0) ops::gather<double, double>(acc.data(), slots.data(), r.data(), G);
+      else WDB_CUDA_CHECK(cudaMemcpy(r.data(), acc.data(), 8, cudaMemcpyDeviceToDevice));
+      return r;
+    };
+    for (size_t a = 0; a < A; ++a) {
+      Acc& ac = accs[a];
+      const ValType& ot = plan.agg_out_types[a];
+      std::shared_ptr<DValue> o;
+      if (plan.aggs[a].func == JAgg::Avg) {
+        auto s = take_f(ac.f);
+        auto c = take_i(ac.cnt);
+        o = new_dvec(Value::F, G);
+        if (G) avg_k<<<ops::grid_for(G), 256>>>(s.data(), c.data(), o->f.data(), G);
+      } else if (plan.acc_is_f[a]) {
+        o = new_dvec(Value::F, 0);
+        o->n = G;
+        o->f = take_f(ac.f);
+      } else {
+        o = new_dvec(ot.kind == Value::S ? Value::S : Value::I, 0);
+        o->n = G;
+        o->i = take_i(ac.i);
+        o->is_date = ot.is_date;
+        o->dict = ot.dict;
+      }
+      out.aggs.push_back(o);
+    }
+    WDB_CUDA_CHECK(cudaGetLastError());
+    jc.notes.push_back(std::string("jit fused ") + (identity ? "scan+filter+" : "") + "aggregate pipeline (" +
+                       std::to_string(preds.size()) + " predicates, " + std::to_string(K) + " keys, " + std::to_string(A) +
+                       " aggregates, " + jit_origin_note(origin, cms, kernel_ms) + ")");
+    return out;
+  } catch (const JitUnsupported&) {
+    return std::nullopt;
+  } catch (const JitError& e) {
+    jc.notes.push_back(std::string("jit aggregate fell back to interpreter: ") + e.what());
+    return std::nullopt;
+  }
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------
 struct GpuBackend::Impl {
   ColumnCache cache;
+  bool jit_enabled = true;
+  size_t jit_min_rows = 200000;
+  size_t jit_force_cap = 0;
   Impl() {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -949,6 +1236,12 @@ GpuMemStats GpuBackend::mem_stats() const {
   return s;
 }
 void GpuBackend::drop_cache() { impl_->cache.clear(); }
+void GpuBackend::set_jit(bool on) { impl_->jit_enabled = on; }
+bool GpuBackend::jit_enabled() const { return impl_->jit_enabled && JitRuntime::instance().available(); }
+void GpuBackend::set_jit_min_rows(size_t n) { impl_->jit_min_rows = n; }
+size_t GpuBackend::jit_min_rows() const { return impl_->jit_min_rows; }
+void GpuBackend::set_jit_force_capacity_for_test(size_t cap) { impl_->jit_force_cap = cap; }
+JitStats GpuBackend::jit_stats() const { return JitRuntime::instance().stats(); }
 bool GpuBackend::column_resident(const Column& c) const { return impl_->cache.resident(c); }
 size_t GpuBackend::cache_budget_bytes() const { return impl_->cache.budget(); }
 void GpuBackend::forget_columns(const std::vector<uint64_t>& uids) {
@@ -1014,28 +1307,50 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
   GpuAllocator::instance().reset_peak();
   GpuCtx ctx{&impl_->cache};
 
+  JitCtx jc;
+  jc.enabled = impl_->jit_enabled && JitRuntime::instance().available();
+  jc.min_rows = impl_->jit_min_rows;
+  jc.force_cap = impl_->jit_force_cap;
+  // A single-table aggregate query is compiled as ONE kernel (scan + filter + group + aggregate), so its scan stage
+  // is skipped here. If that pipeline turns out to be unsupported the scan is performed in the aggregate branch.
+  const bool fused_single = jc.enabled && T == 1 && pq.agg_mode;
+
   // ---- scans with pushed-down filters ----
   std::vector<DRel> rels(T);
   for (int k = 0; k < T; ++k) {
+    if (fused_single) continue;
     Timer t;
     const double up0 = ctx.upload_ms;  // column uploads triggered inside a stage are accounted separately
-    DRel r;
-    r.tbls = {k};
-    r.n = tabs[k]->nrows;
-    r.rid.emplace_back(r.n);
-    if (r.n) ops::iota_k<<<ops::grid_for(r.n), 256>>>(r.rid[0].data(), r.n);
-    DRelScope sc(tabs, std::move(r), &ctx);
-    for (auto& c : pq.push[k]) {
-      DVP b = d_eval(*c, sc);
-      Sel sel = select_true(*b);
-      sc.set_rows(sel.idx, sel.k);
+    const double c0 = jc.compile_ms;   // so are one-off JIT compiles
+    Sel fsel;
+    const bool fused_scan = jit_filter(ctx, pq, k, jc, fsel, nullptr);
+    if (fused_scan) {
+      DRel r;
+      r.tbls = {k};
+      r.n = fsel.k;
+      r.rid.push_back(std::move(fsel.idx));
+      rels[k] = std::move(r);
+    } else {
+      DRel r;
+      r.tbls = {k};
+      r.n = tabs[k]->nrows;
+      r.rid.emplace_back(r.n);
+      if (r.n) ops::iota_k<<<ops::grid_for(r.n), 256>>>(r.rid[0].data(), r.n);
+      DRelScope sc(tabs, std::move(r), &ctx);
+      for (auto& c : pq.push[k]) {
+        DVP b = d_eval(*c, sc);
+        Sel sel = select_true(*b);
+        sc.set_rows(sel.idx, sel.k);
+      }
+      rels[k] = std::move(sc.rel);
     }
-    rels[k] = std::move(sc.rel);
-    const double ms = sync_ms(t) - (ctx.upload_ms - up0);
-    trace("gpu scan " + tabs[k]->name + ": " + std::to_string(tabs[k]->nrows) + " -> " + std::to_string(rels[k].n) +
-          " rows (" + std::to_string(pq.push[k].size()) + " filters, " + fmt_ms(ms) + ")");
+    const double ms = sync_ms(t) - (ctx.upload_ms - up0) - (jc.compile_ms - c0);
+    trace(std::string(fused_scan ? "gpu scan (jit-fused) " : "gpu scan ") + tabs[k]->name + ": " +
+          std::to_string(tabs[k]->nrows) + " -> " + std::to_string(rels[k].n) + " rows (" +
+          std::to_string(pq.push[k].size()) + " filters, " + fmt_ms(ms) + ")");
     res.stages.push_back(make_stat(StageOp::Scan, tabs[k]->name, static_cast<double>(tabs[k]->nrows), 0,
-                                   static_cast<double>(rels[k].n), distinct_columns(pq.push[k]), expr_nodes(pq.push[k]), ms));
+                                   static_cast<double>(rels[k].n), distinct_columns(pq.push[k]),
+                                   expr_nodes(pq.push[k]), ms));
   }
 
   // ---- joins ----
@@ -1092,43 +1407,87 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
   std::unique_ptr<DScope> scope;
   {
     auto rs = std::make_unique<DRelScope>(tabs, std::move(cur), &ctx);
-    for (auto& c : pq.residual) {
-      DVP b = d_eval(*c, *rs);
-      Sel sel = select_true(*b);
-      rs->set_rows(sel.idx, sel.k);
-    }
-    if (!pq.residual.empty()) trace("gpu residual filter -> " + std::to_string(rs->n) + " rows");
+    if (!fused_single)  // (single-table fused pipelines evaluate the residual predicates inside the kernel)
+      for (auto& c : pq.residual) {
+        DVP b = d_eval(*c, *rs);
+        Sel sel = select_true(*b);
+        rs->set_rows(sel.idx, sel.k);
+      }
+    if (!pq.residual.empty() && !fused_single) trace("gpu residual filter -> " + std::to_string(rs->n) + " rows");
 
     if (pq.agg_mode) {
       Timer t;
-      const double up0 = ctx.upload_ms;
-      std::vector<DVP> keyv;
-      for (auto& g : s.group_by) keyv.push_back(d_eval(*g, *rs));
-      std::vector<AggInput> ins;
-      for (auto& a : pq.aggs) {
-        AggInput in;
-        if (a->name == "sum") in.func = SUM;
-        else if (a->name == "count") in.func = COUNT;
-        else if (a->name == "avg") in.func = AVG;
-        else if (a->name == "min") in.func = MIN;
-        else in.func = MAX;
-        if (a->args[0]->kind != Expr::Star) in.arg = d_eval(*a->args[0], *rs);
-        else if (in.func != COUNT) throw Error("* is only valid in count(*)");
-        ins.push_back(in);
+      const double up0 = ctx.upload_ms, c0 = jc.compile_ms;
+      std::optional<AggOutput> fused;
+      size_t kept = 0;
+      double kernel_ms = 0;
+      std::vector<ExprP> single_preds;
+      if (fused_single) {
+        single_preds = pq.push[0];
+        single_preds.insert(single_preds.end(), pq.residual.begin(), pq.residual.end());
+        fused = jit_aggregate(eng, pq, ctx, jc, nullptr, 0, single_preds, &kept, &kernel_ms);
+        if (!fused) {  // unsupported / failed: do the scan now and continue with the interpreted operators
+          DRel r;
+          r.tbls = {0};
+          r.n = tabs[0]->nrows;
+          r.rid.emplace_back(r.n);
+          if (r.n) ops::iota_k<<<ops::grid_for(r.n), 256>>>(r.rid[0].data(), r.n);
+          rs = std::make_unique<DRelScope>(tabs, std::move(r), &ctx);
+          for (auto& c : single_preds) {
+            DVP b = d_eval(*c, *rs);
+            Sel sel = select_true(*b);
+            rs->set_rows(sel.idx, sel.k);
+          }
+        }
+      } else if (jc.enabled) {
+        fused = jit_aggregate(eng, pq, ctx, jc, &rs->rel, -1, {}, &kept, &kernel_ms);
       }
-      size_t nin = rs->n;
-      AggOutput ao = d_hash_aggregate(eng, pq, keyv, ins, nin);
+
+      AggOutput ao;
+      size_t nin = fused_single && fused ? kept : rs->n;
+      if (fused) {
+        ao = std::move(*fused);
+      } else {
+        std::vector<DVP> keyv;
+        for (auto& g : s.group_by) keyv.push_back(d_eval(*g, *rs));
+        std::vector<AggInput> ins;
+        for (auto& a : pq.aggs) {
+          AggInput in;
+          if (a->name == "sum") in.func = SUM;
+          else if (a->name == "count") in.func = COUNT;
+          else if (a->name == "avg") in.func = AVG;
+          else if (a->name == "min") in.func = MIN;
+          else in.func = MAX;
+          if (a->args[0]->kind != Expr::Star) in.arg = d_eval(*a->args[0], *rs);
+          else if (in.func != COUNT) throw Error("* is only valid in count(*)");
+          ins.push_back(in);
+        }
+        ao = d_hash_aggregate(eng, pq, keyv, ins, nin);
+      }
       auto as = std::make_unique<DAggScope>();
       as->n = ao.n;
       for (size_t j = 0; j < s.group_by.size(); ++j) as->m[s.group_by[j]->str()] = ao.keys[j];
       for (size_t a = 0; a < pq.aggs.size(); ++a) as->m[pq.aggs[a]->str()] = ao.aggs[a];
-      const double ams = sync_ms(t) - (ctx.upload_ms - up0);
-      trace("gpu hash aggregate: " + std::to_string(nin) + " rows -> " + std::to_string(ao.n) + " groups (" +
-            std::to_string(s.group_by.size()) + " keys, " + std::to_string(pq.aggs.size()) + " aggs, " +
-            fmt_ms(ams) + ")");
-      res.stages.push_back(make_stat(StageOp::Aggregate, "", static_cast<double>(nin), 0, static_cast<double>(ao.n),
+      const double ams = sync_ms(t) - (ctx.upload_ms - up0) - (jc.compile_ms - c0);
+      trace(std::string(fused ? "gpu hash aggregate (jit-fused" + std::string(fused_single ? " with scan+filter" : "") + "): "
+                              : "gpu hash aggregate: ") +
+            std::to_string(nin) + " rows -> " + std::to_string(ao.n) + " groups (" + std::to_string(s.group_by.size()) +
+            " keys, " + std::to_string(pq.aggs.size()) + " aggs, " + fmt_ms(ams) + ")");
+      StageStat agg_stat = make_stat(StageOp::Aggregate, "", static_cast<double>(nin), 0, static_cast<double>(ao.n),
                                      static_cast<int>(s.group_by.size()), static_cast<int>(pq.aggs.size()), ams,
-                                     agg_expr_nodes(pq)));
+                                     agg_expr_nodes(pq));
+      if (fused_single && fused) {
+        // One kernel did the scan and the aggregation. Attribute its time to the two stages in proportion to what
+        // the cost model predicts for each, so both models keep seeing consistent (fused) magnitudes.
+        StageStat scan_stat = make_stat(StageOp::Scan, tabs[0]->name, static_cast<double>(tabs[0]->nrows), 0,
+                                        static_cast<double>(kept), distinct_columns(pq.push[0]),
+                                        expr_nodes(pq.push[0]), 0);
+        double ps = std::max(eng.cost.predict(scan_stat), 1e-6), pa = std::max(eng.cost.predict(agg_stat), 1e-6);
+        scan_stat.ms = ams * ps / (ps + pa);
+        agg_stat.ms = ams * pa / (ps + pa);
+        res.stages.push_back(scan_stat);
+      }
+      res.stages.push_back(agg_stat);
       scope = std::move(as);
       if (s.having) {
         DVP b = d_eval(*s.having, *scope);
@@ -1191,6 +1550,8 @@ QueryResult GpuBackend::execute(Engine& eng, PlannedQuery& pq) {
   auto& al = GpuAllocator::instance();
   trace("gpu memory: peak " + std::to_string(al.peak() >> 20) + " MB, column cache " +
         std::to_string(impl_->cache.used() >> 20) + " MB");
+  for (auto& n : jc.notes) trace(n);
+  if (jc.compile_ms > 0) trace("gpu jit: " + fmt_ms(jc.compile_ms) + " spent compiling / loading kernels (excluded from stage times)");
   res.ms = total.ms();
   trace("total: " + std::to_string(res.nrows) + " rows in " + fmt_ms(res.ms));
   return res;

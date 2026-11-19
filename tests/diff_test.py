@@ -172,6 +172,7 @@ def main():
     ap.add_argument("--exe", default=os.path.join(ROOT, "build", "release", "warpdb.exe"))
     ap.add_argument("-k", default="", help="only run queries whose name contains this")
     ap.add_argument("--device", default="cpu", choices=["cpu", "gpu", "auto"], help="WarpDB execution device")
+    ap.add_argument("--jit", default="on", choices=["on", "off"], help="GPU JIT pipeline fusion (on = compile for every size)")
     args = ap.parse_args()
 
     ddir = os.path.join(ROOT, "data", f"tpch_sf{args.sf}")
@@ -195,6 +196,10 @@ def main():
     print(f"loaded in {time.time() - t0:.1f}s\n")
     if args.device in ("gpu", "auto"):
         w.run(f".device {args.device}")
+        if args.jit == "on":
+            w.run(".jit minrows 0")  # exercise the fused kernels on every input size
+        else:
+            w.run(".jit off")
         print(f"device = {args.device} (each query runs twice; the second, warm run is timed)\n")
 
     failed = 0

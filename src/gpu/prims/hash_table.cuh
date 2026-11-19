@@ -16,15 +16,6 @@ namespace warpdb::gpu {
 constexpr int64_t HT_EMPTY = INT64_MIN;
 constexpr uint32_t HT_NOT_FOUND = 0xFFFFFFFFu;
 
-__host__ __device__ __forceinline__ uint64_t hash64(uint64_t x) {  // murmur3 finalizer
-  x ^= x >> 33;
-  x *= 0xff51afd7ed558ccdULL;
-  x ^= x >> 33;
-  x *= 0xc4ceb9fe1a85ec53ULL;
-  x ^= x >> 33;
-  return x;
-}
-
 struct HashTableView {
   int64_t* keys;
   uint32_t mask;  // capacity - 1

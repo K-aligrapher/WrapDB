@@ -17,7 +17,7 @@ namespace warpdb {
 
 // Bump whenever stage_work() or the stage vocabulary changes: a stored model is only valid for the work
 // definition it was fitted with (older profiles are discarded and recalibrated automatically).
-constexpr int kProfileVersion = 2;
+constexpr int kProfileVersion = 3;  // 3: GPU stage times now include JIT-fused pipelines
 
 enum class StageOp { Scan = 0, Join, Aggregate, Sort, Project, Upload };
 constexpr int kNumStageOps = 6;

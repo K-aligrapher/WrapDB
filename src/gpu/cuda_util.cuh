@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "gpu/prims/device_defs.cuh"
+
 #define WDB_CUDA_CHECK(call)                                                                        \
   do {                                                                                              \
     cudaError_t e_ = (call);                                                                        \
@@ -78,8 +80,6 @@ class GpuTimer {
  private:
   cudaEvent_t a_, b_;
 };
-
-constexpr uint32_t FULL_MASK = 0xFFFFFFFFu;
 
 inline size_t ceil_div(size_t a, size_t b) { return (a + b - 1) / b; }
 

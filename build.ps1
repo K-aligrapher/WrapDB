@@ -25,7 +25,12 @@ $env:PATH = "$venv;$env:PATH"
 
 if ($Clean -and (Test-Path $buildDir)) { Remove-Item -Recurse -Force $buildDir }
 
-cmake -S $root -B $buildDir -G Ninja "-DCMAKE_BUILD_TYPE=$Config"
+# Pin the interpreter used for the pybind11 module to THIS project's venv (CMake would otherwise honour whatever
+# VIRTUAL_ENV happens to be active in the shell).
+$py = Join-Path $venv "python.exe"
+$pyArg = @()
+if (Test-Path $py) { $pyArg = @("-DPython3_EXECUTABLE=$py", "-DPython3_FIND_VIRTUALENV=ONLY") }
+cmake -S $root -B $buildDir -G Ninja "-DCMAKE_BUILD_TYPE=$Config" @pyArg
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 cmake --build $buildDir
 if ($LASTEXITCODE) { exit $LASTEXITCODE }

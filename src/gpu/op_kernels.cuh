@@ -5,6 +5,7 @@
 #include <type_traits>
 
 #include "gpu/memory.cuh"
+#include "gpu/prims/agg_device.cuh"
 #include "gpu/prims/hash_table.cuh"
 #include "gpu/prims/radix_sort.cuh"
 #include "gpu/prims/scan.cuh"
@@ -12,7 +13,11 @@
 
 namespace warpdb::gpu::ops {
 
-constexpr uint32_t EMPTY_SLOT = 0xFFFFFFFFu;
+using warpdb::gpu::EMPTY_SLOT;
+using warpdb::gpu::AggOp;
+using warpdb::gpu::A_SUM;
+using warpdb::gpu::A_MIN;
+using warpdb::gpu::A_MAX;
 inline unsigned grid_for(size_t n, unsigned block = 256) { return static_cast<unsigned>(ceil_div(n ? n : 1, block)); }
 
 // ---- operands: a vector in device memory, or a broadcast scalar -----------------------------------
@@ -212,58 +217,22 @@ static __global__ void agg_insert_k(KeyPtrs keys, size_t n, uint32_t* rep, uint3
   row_slot[i] = 0;
 }
 
-enum AggOp { A_SUM = 0, A_MIN = 1, A_MAX = 2 };
-
-template <int OP, class V>
-__device__ __forceinline__ V agg_combine(V a, V b) {
-  if constexpr (OP == A_SUM) return a + b;
-  else if constexpr (OP == A_MIN) return b < a ? b : a;
-  else return b > a ? b : a;
-}
-template <int OP, class V>
-__device__ __forceinline__ void agg_atomic(V* p, V v) {
-  if constexpr (std::is_same_v<V, int64_t>) {
-    if constexpr (OP == A_SUM) atomicAdd(reinterpret_cast<unsigned long long*>(p), static_cast<unsigned long long>(v));
-    else if constexpr (OP == A_MIN) atomicMin(reinterpret_cast<long long*>(p), static_cast<long long>(v));
-    else atomicMax(reinterpret_cast<long long*>(p), static_cast<long long>(v));
-  } else {
-    if constexpr (OP == A_SUM) {
-      atomicAdd(p, v);
-    } else {
-      auto* ull = reinterpret_cast<unsigned long long*>(p);
-      unsigned long long old = *ull, assumed;
-      do {
-        assumed = old;
-        double cur = __longlong_as_double(static_cast<long long>(assumed));
-        if (OP == A_MIN ? !(v < cur) : !(v > cur)) break;
-        old = atomicCAS(ull, assumed, static_cast<unsigned long long>(__double_as_longlong(v)));
-      } while (old != assumed);
-    }
-  }
-}
-
-// acc[slot] (op)= value(row). With warp_agg, lanes of a warp that hit the same slot are pre-combined with
-// shuffles so only one atomic per (warp, slot) reaches memory -- essential for low-cardinality GROUP BY
-// and global aggregates, where all lanes would otherwise serialize on a handful of addresses.
 template <int OP, class V, class Arg>
 __global__ void agg_update_k(Arg arg, const uint32_t* row_slot, size_t n, V* acc, int warp_agg) {
   size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
   const bool valid = i < n;
   uint32_t slot = valid ? (row_slot ? row_slot[i] : 0u) : EMPTY_SLOT;
   V v = valid ? static_cast<V>(arg[i]) : V(0);
-  if (!warp_agg) {
-    if (valid) agg_atomic<OP, V>(acc + slot, v);
-    return;
-  }
-  const uint32_t lane = threadIdx.x & 31;
-  uint32_t peers = __match_any_sync(FULL_MASK, slot);
-  V r = v;  // the lowest lane of each peer group ends up holding the combination of the whole group
-  for (int j = 0; j < 32; ++j) {
-    V t = __shfl_sync(FULL_MASK, v, j);  // executed by all lanes, every iteration (uniform control flow)
-    if (((peers >> j) & 1u) && j != static_cast<int>(lane)) r = agg_combine<OP, V>(r, t);
-  }
-  if (valid && static_cast<uint32_t>(__ffs(peers) - 1) == lane) agg_atomic<OP, V>(acc + slot, r);
+  agg_apply<OP, V>(acc, slot, v, warp_agg);  // all lanes participate (warp-wide intrinsics inside)
 }
+
+struct StateGen {  // enumerates ready slots of a fused-aggregate group table (state[slot] == 2)
+  const uint32_t* state;
+  __device__ __forceinline__ bool eval(size_t i, uint32_t& v) const {
+    v = static_cast<uint32_t>(i);
+    return state[i] == 2u;
+  }
+};
 
 struct SlotGen {  // enumerates occupied hash slots for compaction
   const uint32_t* rep;
