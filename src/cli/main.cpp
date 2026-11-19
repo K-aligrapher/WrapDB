@@ -7,6 +7,7 @@
 
 #include "exec/engine.h"
 #include "gpu/device.h"
+#include "gpu/gpu_backend.h"
 #include "storage/csv.h"
 
 using namespace warpdb;
@@ -91,14 +92,39 @@ const char* HELP =
     "  .mode csv|table                           output format\n"
     "  .timer on|off                             show timings\n"
     "  .gpu                                      show GPU info\n"
+    "  .device cpu|gpu                           choose where queries execute\n"
+    "  .gpustats                                 GPU memory / column-cache statistics\n"
+    "  .dropcache                                evict resident GPU columns (next GPU query runs cold)\n"
     "  .quit                                     exit\n"
     "SQL: SELECT ... FROM ... [JOIN ... ON ...] [WHERE] [GROUP BY] [HAVING] [ORDER BY] [LIMIT]; prefix with EXPLAIN to see the execution trace.\n";
+
+std::shared_ptr<gpu::GpuBackend> g_gpu;  // created at startup if a CUDA device exists
 
 // returns false to quit
 bool run_command(Engine& eng, Settings& st, const std::string& line) {
   auto a = split_ws(line);
   const std::string& c = a[0];
   if (c == ".quit" || c == ".exit") return false;
+  if (c == ".device") {
+    if (a.size() < 2 || (a[1] != "cpu" && a[1] != "gpu")) throw Error("usage: .device cpu|gpu");
+    if (a[1] == "gpu" && !g_gpu) throw Error("no CUDA device available");
+    eng.device = a[1];
+    std::printf("device = %s\n", eng.device.c_str());
+    return true;
+  }
+  if (c == ".gpustats" || c == ".dropcache") {
+    if (!g_gpu) throw Error("no CUDA device available");
+    if (c == ".dropcache") {
+      g_gpu->drop_cache();
+      std::printf("GPU column cache cleared\n");
+      return true;
+    }
+    auto m = g_gpu->mem_stats();
+    std::printf("column cache: %.1f / %.1f MB   allocator: %.1f MB in use, %.1f MB peak, %.1f MB reserved   uploaded total: %.1f MB\n",
+                m.cache_bytes / 1048576.0, m.cache_budget / 1048576.0, m.in_use / 1048576.0, m.peak / 1048576.0,
+                m.reserved / 1048576.0, m.uploaded_total / 1048576.0);
+    return true;
+  }
   if (c == ".help") { std::printf("%s", HELP); return true; }
   if (c == ".mode" && a.size() > 1) { st.csv = a[1] == "csv"; return true; }
   if (c == ".timer" && a.size() > 1) { st.timer = a[1] == "on"; return true; }
@@ -153,8 +179,20 @@ int main(int argc, char** argv) {
     else if (a == "-c" && i + 1 < argc) once = argv[++i];
     else if (a == "--help" || a == "-h") { std::printf("warpdb [--csv] [--protocol] [-c \"sql\"]\n%s", HELP); return 0; }
   }
+  {
+    gpu::DeviceInfo d;
+    if (gpu::query_device(d)) {
+      try {
+        g_gpu = gpu::make_gpu_backend();
+        eng.set_gpu_backend(g_gpu);
+      } catch (const std::exception&) {
+        g_gpu.reset();
+      }
+    }
+  }
   const bool tty = _isatty(_fileno(stdin)) != 0;
-  if (tty && once.empty()) std::printf("WarpDB v0.1 (CPU engine) - type .help for help\n");
+  if (tty && once.empty())
+    std::printf("WarpDB v0.1 (%s) - type .help for help\n", g_gpu ? "CPU + GPU engines; .device gpu to use the GPU" : "CPU engine");
 
   auto run_sql = [&](const std::string& sql) {
     try {

@@ -169,6 +169,7 @@ def main():
     ap.add_argument("--sf", type=float, default=0.1)
     ap.add_argument("--exe", default=os.path.join(ROOT, "build", "release", "warpdb.exe"))
     ap.add_argument("-k", default="", help="only run queries whose name contains this")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "gpu"], help="WarpDB execution device")
     args = ap.parse_args()
 
     ddir = os.path.join(ROOT, "data", f"tpch_sf{args.sf}")
@@ -190,6 +191,9 @@ def main():
         text, _ = w.run(f".load {t} {os.path.join(ddir, t + '.csv')}")
         print("  " + text.strip())
     print(f"loaded in {time.time() - t0:.1f}s\n")
+    if args.device == "gpu":
+        w.run(".device gpu")
+        print("executing on the GPU (each query runs twice; the second, warm run is timed)\n")
 
     failed = 0
     ran = 0
@@ -203,6 +207,8 @@ def main():
             t = time.time()
             duck_rows = duck.execute(sql).fetchall()
             dms = (time.time() - t) * 1000
+            if args.device == "gpu":
+                w.query(sql)  # cold run: uploads the needed columns to VRAM
             _, wrows, wms = w.query(sql)
             err = compare(wrows, duck_rows, ordered)
         except Exception as e:  # noqa: BLE001

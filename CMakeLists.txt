@@ -23,9 +23,10 @@ add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
                     $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=177>)  # 177: unused gtest members
 
 # ---- core library ----
-add_library(warpdb_gpu STATIC src/gpu/device.cu src/gpu/hello_kernel.cu)
+add_library(warpdb_gpu STATIC src/gpu/device.cu src/gpu/hello_kernel.cu src/gpu/gpu_backend.cu)
 target_include_directories(warpdb_gpu PUBLIC src)
 set_target_properties(warpdb_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+target_link_libraries(warpdb_gpu PUBLIC warpdb_core)
 
 # ---- CPU engine core (storage, SQL front end, executor) ----
 add_library(warpdb_core STATIC
@@ -58,7 +59,7 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
-add_executable(warpdb_tests tests/test_device.cpp tests/test_sql.cpp tests/test_gpu_prims.cu)
+add_executable(warpdb_tests tests/test_device.cpp tests/test_sql.cpp tests/test_gpu_prims.cu tests/test_gpu_engine.cu)
 target_link_libraries(warpdb_tests PRIVATE warpdb_core warpdb_gpu GTest::gtest_main)
 include(GoogleTest)
 gtest_discover_tests(warpdb_tests)

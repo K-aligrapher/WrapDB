@@ -3,7 +3,14 @@
 A from-scratch GPU SQL engine (C++/CUDA, no libcudf) with JIT-fused pipelines and a
 residency-aware CPU/GPU placement optimizer. See [docs/PRD.md](docs/PRD.md).
 
-**Status:** Phase 2 — hand-written GPU primitives done and benchmarked against CUB
+**Status:** Phase 3 — SQL executes on the GPU. `.device gpu` in the CLI runs the same queries with CUDA kernels
+(scan+filter, hash join, hash aggregate, radix sort, top-k) on top of a caching GPU allocator and a VRAM column cache.
+All 31 differential queries match DuckDB on the GPU at SF0.1 and SF1. TPC-H SF1 (warm, columns resident in VRAM):
+geomean **7.1 ms** on the GPU vs 190 ms on the CPU path (26.7x) vs 54 ms for DuckDB (7.6x) —
+see [docs/BENCHMARKS_TPCH.md](docs/BENCHMARKS_TPCH.md). Cold runs include the PCIe upload of the needed columns.
+`.\.venv\Scripts\python tests\diff_test.py --sf 1 --device gpu`, `.\.venv\Scripts\python tests\bench_tpch.py`.
+
+**Phase 2** — hand-written GPU primitives done and benchmarked against CUB
 ([docs/BENCHMARKS_GPU_PRIMS.md](docs/BENCHMARKS_GPU_PRIMS.md)): single-pass decoupled look-back scan (parity with CUB),
 fused warp-ballot compaction (parity or better, 3-5x faster than flags+scan+scatter), stable onesweep-style radix sort
 (0.65-0.86x of CUB), lock-free open-addressing hash table (7-10x faster than sort-based distinct counting).

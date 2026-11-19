@@ -42,5 +42,6 @@ VP gather_value(const VP& v, const std::vector<uint32_t>& idx);
 VP materialize(const VP& v, size_t n);  // broadcast scalars to n rows
 std::vector<uint32_t> select_true(const Value& b);
 std::string format_cell(const Value& v, size_t row);
+bool like_match(const std::string& s, const std::string& pattern);  // SQL LIKE with % and _
 
 }  // namespace warpdb

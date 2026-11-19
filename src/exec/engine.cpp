@@ -491,11 +491,6 @@ void split_and(const ExprP& e, std::vector<ExprP>& out) {
   }
 }
 
-struct Edge {
-  int ta, tb;
-  ExprP ea, eb;
-};
-
 std::string fmt_ms(double ms) {
   char b[32];
   std::snprintf(b, sizeof b, "%.2f ms", ms);
@@ -505,7 +500,7 @@ std::string fmt_ms(double ms) {
 }  // namespace
 
 // ------------------------------------------------------------------------------------------
-double Engine::column_ndv(const std::shared_ptr<Table>& t, int col, int) {
+double Engine::column_ndv(const std::shared_ptr<Table>& t, int col) {
   uint64_t key = (reinterpret_cast<uint64_t>(t.get()) << 8) ^ static_cast<uint64_t>(col);
   auto it = ndv_cache_.find(key);
   if (it != ndv_cache_.end()) return it->second;
@@ -536,12 +531,59 @@ double Engine::column_ndv(const std::shared_ptr<Table>& t, int col, int) {
   return est;
 }
 
+double Engine::key_ndv(const PlannedQuery& pq, const ExprP& e, size_t n) {
+  double nn = std::max<double>(1.0, static_cast<double>(n));
+  if (e->kind != Expr::Col) return nn;
+  return std::min(column_ndv(pq.tabs[e->tbl], e->col), nn);
+}
+
+int Engine::pick_start(const PlannedQuery& pq, const std::vector<size_t>& rel_n) const {
+  const int T = static_cast<int>(pq.tabs.size());
+  int start = 0;
+  size_t best = SIZE_MAX;
+  for (int k = 0; k < T; ++k) {
+    bool has_edge = T == 1;
+    for (auto& e : pq.edges) has_edge |= (e.ta == k || e.tb == k);
+    if (has_edge && rel_n[k] < best) { best = rel_n[k]; start = k; }
+  }
+  return start;
+}
+
+// Pick the connected table whose join with the current result is estimated to be smallest:
+//   |cur| * |cand| / prod_over_edges(max(ndv(cur key), ndv(cand key)))
+int Engine::pick_next(const PlannedQuery& pq, const std::vector<bool>& joined, size_t cur_n,
+                      const std::vector<size_t>& rel_n) {
+  const int T = static_cast<int>(pq.tabs.size());
+  int best = -1;
+  double best_est = 0;
+  for (int k = 0; k < T; ++k) {
+    if (joined[k]) continue;
+    bool conn = false;
+    double est = static_cast<double>(cur_n) * static_cast<double>(rel_n[k]);
+    for (auto& e : pq.edges) {
+      bool cur_is_a = joined[e.ta] && e.tb == k, cur_is_b = joined[e.tb] && e.ta == k;
+      if (!cur_is_a && !cur_is_b) continue;
+      conn = true;
+      double nc = key_ndv(pq, cur_is_a ? e.ea : e.eb, cur_n), nk = key_ndv(pq, cur_is_a ? e.eb : e.ea, rel_n[k]);
+      est /= std::max(1.0, std::max(nc, nk));
+    }
+    if (conn && (best < 0 || est < best_est)) { best = k; best_est = est; }
+  }
+  return best;
+}
+
 QueryResult Engine::execute(const std::string& sql) {
-  Timer total;
+  PlannedQuery pq = plan(sql);
+  if (device == "gpu" && gpu_) {
+    QueryResult r = gpu_->execute(*this, pq);
+    r.explain = pq.sel.explain;
+    return r;
+  }
+  return execute_cpu(pq);
+}
+
+PlannedQuery Engine::plan(const std::string& sql) {
   Select s = parse_sql(sql);
-  QueryResult res;
-  res.explain = s.explain;
-  auto trace = [&](const std::string& m) { res.trace.push_back(m); };
 
   // ---- FROM ----
   TableVec tabs;
@@ -681,6 +723,31 @@ QueryResult Engine::execute(const std::string& sql) {
     }
   }
 
+  PlannedQuery pq;
+  pq.sel = std::move(s);
+  pq.tabs = std::move(tabs);
+  pq.aggs = std::move(aggs);
+  pq.agg_mode = agg_mode;
+  pq.push = std::move(push);
+  pq.edges = std::move(edges);
+  pq.residual = std::move(residual);
+  return pq;
+}
+
+QueryResult Engine::execute_cpu(PlannedQuery& pq) {
+  Timer total;
+  Select& s = pq.sel;
+  TableVec& tabs = pq.tabs;
+  auto& aggs = pq.aggs;
+  const bool agg_mode = pq.agg_mode;
+  auto& push = pq.push;
+  auto& edges = pq.edges;
+  auto& residual = pq.residual;
+  const int T = static_cast<int>(tabs.size());
+  QueryResult res;
+  res.explain = s.explain;
+  auto trace = [&](const std::string& m) { res.trace.push_back(m); };
+
   // ---- scans with pushed-down filters ----
   std::vector<Relation> rels(T);
   for (int k = 0; k < T; ++k) {
@@ -705,40 +772,13 @@ QueryResult Engine::execute(const std::string& sql) {
   Relation cur;
   {
     std::vector<bool> joined(T, false);
-    int start = 0;
-    {
-      size_t best = SIZE_MAX;
-      for (int k = 0; k < T; ++k) {
-        bool has_edge = T == 1;
-        for (auto& e : edges) has_edge |= (e.ta == k || e.tb == k);
-        if (has_edge && rels[k].n < best) { best = rels[k].n; start = k; }
-      }
-    }
+    std::vector<size_t> rel_n(T);
+    for (int k = 0; k < T; ++k) rel_n[k] = rels[k].n;
+    int start = pick_start(pq, rel_n);
     cur = std::move(rels[start]);
     joined[start] = true;
-    // NDV of a join-key expression within a relation (columns only; otherwise assume unique).
-    auto key_ndv = [&](const ExprP& e, const Relation& r) -> double {
-      if (e->kind != Expr::Col) return std::max<double>(1.0, static_cast<double>(r.n));
-      return std::min(column_ndv(tabs[e->tbl], e->col, e->tbl), std::max<double>(1.0, static_cast<double>(r.n)));
-    };
     for (int remaining = T - 1; remaining > 0; --remaining) {
-      // Pick the connected table whose join with the current result is estimated to be smallest:
-      //   |cur| * |cand| / prod_over_edges(max(ndv(cur key), ndv(cand key)))
-      int best = -1;
-      double best_est = 0;
-      for (int k = 0; k < T; ++k) {
-        if (joined[k]) continue;
-        bool conn = false;
-        double est = static_cast<double>(cur.n) * static_cast<double>(rels[k].n);
-        for (auto& e : edges) {
-          bool cur_is_a = joined[e.ta] && e.tb == k, cur_is_b = joined[e.tb] && e.ta == k;
-          if (!cur_is_a && !cur_is_b) continue;
-          conn = true;
-          double nc = key_ndv(cur_is_a ? e.ea : e.eb, cur), nk = key_ndv(cur_is_a ? e.eb : e.ea, rels[k]);
-          est /= std::max(1.0, std::max(nc, nk));
-        }
-        if (conn && (best < 0 || est < best_est)) { best = k; best_est = est; }
-      }
+      int best = pick_next(pq, joined, cur.n, rel_n);
       if (best < 0) throw Error("cross joins are not supported: add an equality join condition between all tables");
       Timer t;
       std::vector<ExprP> kc, kb;

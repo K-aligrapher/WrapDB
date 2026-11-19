@@ -188,7 +188,7 @@ VP negate(const Value& a, size_t n) {
   return v;
 }
 
-bool like_match(const std::string& s, const std::string& p) {
+bool like_match_impl(const std::string& s, const std::string& p) {
   size_t si = 0, pi = 0, star = std::string::npos, mark = 0;
   while (si < s.size()) {
     if (pi < p.size() && (p[pi] == '_' || p[pi] == s[si])) { ++si; ++pi; }
@@ -203,6 +203,8 @@ bool like_match(const std::string& s, const std::string& p) {
 VP bool_not(VP v, size_t n) { return negate(*v, n); }
 
 }  // namespace
+
+bool like_match(const std::string& s, const std::string& pattern) { return like_match_impl(s, pattern); }
 
 // ---------------------------------------------------------------------------------------------
 VP gather_column(const std::shared_ptr<Column>& c, const std::vector<uint32_t>& rid) {
@@ -423,7 +425,7 @@ VP eval(const Expr& e, Scope& sc) {
       if (x->kind != Value::S || p->kind != Value::L) throw Error("LIKE requires a VARCHAR column and a string pattern");
       const auto& d = x->dict->dict;
       std::vector<uint8_t> mask(d.size());
-      for (size_t k = 0; k < d.size(); ++k) mask[k] = like_match(d[k], p->lit);
+      for (size_t k = 0; k < d.size(); ++k) mask[k] = like_match_impl(d[k], p->lit);
       VP r = mask_to_bool(*x, mask, n);
       return e.negated ? bool_not(r, n) : r;
     }
